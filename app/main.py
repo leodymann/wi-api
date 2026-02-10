@@ -20,7 +20,7 @@ from app.api.routers.test import router as test
 from dotenv import load_dotenv
 load_dotenv()
 # make uploads path configurable (can be replaced with S3 in prod)
-UPLOAD_ROOT = Path(os.environ.get("UPLOAD_ROOT", "uploads"))
+#UPLOAD_ROOT = Path(os.environ.get("UPLOAD_ROOT", "uploads"))
 
 # allowed origins can be provided as a comma-separated env var
 _env_origins = os.environ.get("FRONTEND_URLS") or os.environ.get("ALLOWED_ORIGINS")
@@ -51,9 +51,9 @@ def _startup() -> None:
     print("[startup] creating tables...")
     Base.metadata.create_all(bind=engine)
     print("[startup] tables created/checked")
-    UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    #UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
-app.mount("/static", StaticFiles(directory=str(UPLOAD_ROOT)), name="static")
+#app.mount("/static", StaticFiles(directory=str(UPLOAD_ROOT)), name="static")
 
 
 
@@ -66,3 +66,4 @@ app.include_router(users_router, prefix="/users", tags=["users"])
 app.include_router(finance_router, prefix="/finance", tags=["finance"])
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(test, prefix="/test", tags=["test"])
+
