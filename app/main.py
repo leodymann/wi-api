@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.requests import Request
 import os
 
 from app.infra.db import engine
@@ -30,18 +31,34 @@ else:
         "http://127.0.0.1:3000",
     ]
 
-# ✅ pega:
-# - Tauri build: Origin tipo http://[fd12:...]:8080  (IPv6/host local)
-# - localhost/127.0.0.1 em qualquer porta (dev/prod local)
-ALLOW_ORIGIN_REGEX = r"^http://(\[.*\]|localhost|127\.0\.0\.1)(:\d+)?$"
+# ✅ cobre:
+# - tauri://localhost (muito comum no build)
+# - http://localhost[:porta]
+# - http://127.0.0.1[:porta]
+# - http://[ipv6]:porta (seu caso)
+ALLOW_ORIGIN_REGEX = r"^(tauri://localhost|http://(\[.*\]|localhost|127\.0\.0\.1)(:\d+)?)$"
 
 app = FastAPI(title="Moto Store API")
 
+# ✅ Log pra você enxergar o preflight no Railway (remova depois se quiser)
+@app.middleware("http")
+async def _log_preflight(request: Request, call_next):
+    if request.method == "OPTIONS" or request.url.path.startswith("/auth/login"):
+        print(
+            "[REQ]",
+            request.method,
+            request.url.path,
+            "origin=", request.headers.get("origin"),
+            "acr-method=", request.headers.get("access-control-request-method"),
+            "acr-headers=", request.headers.get("access-control-request-headers"),
+        )
+    return await call_next(request)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS_LIST,      # lista tradicional (web)
-    allow_origin_regex=ALLOW_ORIGIN_REGEX, # ✅ Tauri/desktop e localhost variáveis
-    allow_credentials=False,
+    allow_origins=ALLOW_ORIGINS_LIST,       # lista tradicional (web)
+    allow_origin_regex=ALLOW_ORIGIN_REGEX,  # ✅ tauri + localhost + ipv6
+    allow_credentials=False,                # ✅ você usa Bearer token, não cookie
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
@@ -65,4 +82,3 @@ app.include_router(users_router, prefix="/users", tags=["users"])
 app.include_router(finance_router, prefix="/finance", tags=["finance"])
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(test, prefix="/test", tags=["test"])
-
