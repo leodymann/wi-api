@@ -1,11 +1,17 @@
+from __future__ import annotations
+
 from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from pathlib import Path
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 import os
 
-from app.infra.db import engine
-from app.infra.models import Base
+from dotenv import load_dotenv
+load_dotenv()
+
+from app.infra.db import engine, SessionLocal
+from app.infra.models import Base, UserORM
+from app.services.security import hash_password
 
 from app.api.routers.clients import router as clients_router
 from app.api.routers.products import router as products_router
@@ -17,10 +23,6 @@ from app.api.routers.finance import router as finance_router
 from app.api.routers.auth import router as auth_router
 from app.api.routers.test import router as test
 
-from dotenv import load_dotenv
-load_dotenv()
-# make uploads path configurable (can be replaced with S3 in prod)
-#UPLOAD_ROOT = Path(os.environ.get("UPLOAD_ROOT", "uploads"))
 
 # allowed origins can be provided as a comma-separated env var
 _env_origins = os.environ.get("FRONTEND_URLS") or os.environ.get("ALLOWED_ORIGINS")
@@ -34,6 +36,7 @@ else:
         "http://127.0.0.1:3000",
     ]
 
+
 app = FastAPI(title="Moto Store API")
 
 app.add_middleware(
@@ -42,19 +45,62 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"]
+    expose_headers=["*"],
 )
+
 print("[CORS] allow_origins =", ALLOW_ORIGINS_LIST)
+
+
+def ensure_admin(db: Session) -> None:
+    """
+    Cria um usuário admin caso não exista.
+    Configure via variáveis de ambiente no Railway:
+      ADMIN_EMAIL, ADMIN_PASSWORD, ADMIN_NAME
+    """
+    email = os.getenv("ADMIN_EMAIL", "admin@admin.com").strip().lower()
+    password = os.getenv("ADMIN_PASSWORD", "admin123").strip()
+    name = os.getenv("ADMIN_NAME", "Admin").strip()
+
+    if not email or not password:
+        print("[startup] admin vars inválidas; pulando criação do admin")
+        return
+
+    existing = db.query(UserORM).filter(UserORM.email == email).first()
+    if existing:
+        return
+
+    user = UserORM(
+        name=name,
+        email=email,
+        password_hash=hash_password(password),
+        role="ADMIN",
+    )
+    db.add(user)
+    try:
+        db.commit()
+        print("Admin criado")
+    except IntegrityError:
+        db.rollback()
+        # Em caso de corrida (2 instâncias subindo), ignora
+        print("Admin já existe")
+
 
 @app.on_event("startup")
 def _startup() -> None:
     print("[startup] creating tables...")
     Base.metadata.create_all(bind=engine)
     print("[startup] tables created/checked")
-    #UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
-#app.mount("/static", StaticFiles(directory=str(UPLOAD_ROOT)), name="static")
+    db = SessionLocal()
+    try:
+        ensure_admin(db)
+    finally:
+        db.close()
 
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 app.include_router(clients_router, prefix="/clients", tags=["clients"])
@@ -66,4 +112,3 @@ app.include_router(users_router, prefix="/users", tags=["users"])
 app.include_router(finance_router, prefix="/finance", tags=["finance"])
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(test, prefix="/test", tags=["test"])
-
