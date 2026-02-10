@@ -497,7 +497,7 @@ def process_daily_product_offers(db: Session, group_to: str) -> int:
             f"🏍️ Modelo: {p.brand} {p.model}\n"
             f"🎨 Cor: {p.color}\n"
             f"📆 Ano: {p.year}\n"
-            f"🛣️ Kilometragem: {p.km}\n"
+            f"🛣️ Kilometragem: {p.km}km\n"
             f"💰 *Preço: {format_brl(p.sale_price)}*\n"
         )
 
@@ -612,3 +612,4 @@ if __name__ == "__main__":
         run_loop()
     except KeyboardInterrupt:
         print("[worker] stopped (Ctrl+C)")
+
