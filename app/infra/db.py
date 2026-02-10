@@ -7,13 +7,31 @@ from sqlalchemy.orm import sessionmaker, Session
 
 from app.config import settings
 
+
+def _normalize_database_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        raise RuntimeError("DATABASE_URL não configurada.")
+
+    # Railway / Heroku costumam usar postgres://
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg2://", 1)
+
+    # Se vier postgresql:// sem driver, coloca psycopg2
+    if url.startswith("postgresql://") and "+psycopg2" not in url:
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+
+    return url
+
+
+DATABASE_URL = _normalize_database_url(settings.DATABASE_URL)
+
 engine = create_engine(
-    settings.DATABASE_URL,
+    DATABASE_URL,
     pool_pre_ping=True,
-    future=True
+    future=True,
 )
 
-# session factory
 SessionLocal = sessionmaker(
     bind=engine,
     autoflush=False,
@@ -21,6 +39,7 @@ SessionLocal = sessionmaker(
     expire_on_commit=False,
     class_=Session,
 )
+
 
 def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
