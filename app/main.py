@@ -1,17 +1,9 @@
-from __future__ import annotations
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
 import os
 
-from dotenv import load_dotenv
-load_dotenv()
-
-from app.infra.db import engine, SessionLocal
-from app.infra.models import Base, UserORM
-from app.services.security import hash_password
+from app.infra.db import engine
+from app.infra.models import Base
 
 from app.api.routers.clients import router as clients_router
 from app.api.routers.products import router as products_router
@@ -23,6 +15,8 @@ from app.api.routers.finance import router as finance_router
 from app.api.routers.auth import router as auth_router
 from app.api.routers.test import router as test
 
+from dotenv import load_dotenv
+load_dotenv()
 
 # allowed origins can be provided as a comma-separated env var
 _env_origins = os.environ.get("FRONTEND_URLS") or os.environ.get("ALLOWED_ORIGINS")
@@ -36,12 +30,17 @@ else:
         "http://127.0.0.1:3000",
     ]
 
+# ✅ pega:
+# - Tauri build: Origin tipo http://[fd12:...]:8080  (IPv6/host local)
+# - localhost/127.0.0.1 em qualquer porta (dev/prod local)
+ALLOW_ORIGIN_REGEX = r"^http://(\[.*\]|localhost|127\.0\.0\.1)(:\d+)?$"
 
 app = FastAPI(title="Moto Store API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS_LIST,
+    allow_origins=ALLOW_ORIGINS_LIST,      # lista tradicional (web)
+    allow_origin_regex=ALLOW_ORIGIN_REGEX, # ✅ Tauri/desktop e localhost variáveis
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -49,59 +48,13 @@ app.add_middleware(
 )
 
 print("[CORS] allow_origins =", ALLOW_ORIGINS_LIST)
-
-
-def ensure_admin(db: Session) -> None:
-    """
-    Cria um usuário admin caso não exista.
-    Configure via variáveis de ambiente no Railway:
-      ADMIN_EMAIL, ADMIN_PASSWORD, ADMIN_NAME
-    """
-    email = os.getenv("ADMIN_EMAIL", "admin@admin.com").strip().lower()
-    password = os.getenv("ADMIN_PASSWORD", "admin123").strip()
-    name = os.getenv("ADMIN_NAME", "Admin").strip()
-
-    if not email or not password:
-        print("[startup] admin vars inválidas; pulando criação do admin")
-        return
-
-    existing = db.query(UserORM).filter(UserORM.email == email).first()
-    if existing:
-        return
-
-    user = UserORM(
-        name=name,
-        email=email,
-        password_hash=hash_password(password),
-        role="ADMIN",
-    )
-    db.add(user)
-    try:
-        db.commit()
-        print("Admin criado")
-    except IntegrityError:
-        db.rollback()
-        # Em caso de corrida (2 instâncias subindo), ignora
-        print("Admin já existe")
-
+print("[CORS] allow_origin_regex =", ALLOW_ORIGIN_REGEX)
 
 @app.on_event("startup")
 def _startup() -> None:
     print("[startup] creating tables...")
     Base.metadata.create_all(bind=engine)
     print("[startup] tables created/checked")
-
-    db = SessionLocal()
-    try:
-        ensure_admin(db)
-    finally:
-        db.close()
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
 
 app.include_router(clients_router, prefix="/clients", tags=["clients"])
 app.include_router(products_router, prefix="/products", tags=["products"])
