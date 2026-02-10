@@ -1,0 +1,86 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: moto_db
+    environment:
+      POSTGRES_DB: moto_store
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5435:5432"
+    volumes:
+      - moto_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d moto_store"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: moto_backend
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/moto_store
+      JWT_SECRET: "wesley-motos-2026-dev-by-leo"
+      JWT_EXPIRES_MINUTES: "120"
+
+      BLIBSEND_BASE_URL: "https://prod.blibsend.click/v2"
+      BLIBSEND_SESSION_TOKEN: "p_b4GABWmU86tem7yntRKBaiONVTBSlF"
+      BLIBSEND_CLIENT_ID: "ClientId_/4WWTa+p2PfkuPLF2wu1tSvPq/snZhLh5RYcw5Hw8Pg="
+      BLIBSEND_CLIENT_SECRET: "ClientSecret_/4WWTa+p2PfkuPLF2wu1tSvPq/snZhLh5RYcw5Hw8Pg="
+      BLIBSEND_DEFAULT_TO: "5583987157461"
+      BLIBSEND_GROUP_TO: "120363163231771641@g.us"
+
+      UPLOAD_ROOT: "uploads"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8100:8000"
+    volumes:
+      - ./uploads:/app/uploads
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: moto_worker
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/moto_store
+
+      BLIBSEND_BASE_URL: "https://prod.blibsend.click/v2"
+      BLIBSEND_SESSION_TOKEN: "p_b4GABWmU86tem7yntRKBaiONVTBSlF"
+      BLIBSEND_CLIENT_ID: "ClientId_/4WWTa+p2PfkuPLF2wu1tSvPq/snZhLh5RYcw5Hw8Pg="
+      BLIBSEND_CLIENT_SECRET: "ClientSecret_/4WWTa+p2PfkuPLF2wu1tSvPq/snZhLh5RYcw5Hw8Pg="
+      BLIBSEND_DEFAULT_TO: "5583987157461"
+      BLIBSEND_GROUP_TO: "120363163231771641@g.us"
+
+      WORKER_INTERVAL_SECONDS: "30"
+      PROMISSORY_REMINDER_DAYS: "5"
+      OFFERS_HOUR: "9"
+      OFFERS_LIMIT: "20"
+    depends_on:
+      db:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    volumes:
+      - ./uploads:/app/uploads
+
+  frontend:
+    build:
+      context: ./wi-front
+      dockerfile: Dockerfile
+    container_name: moto_frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_started
+
+volumes:
+  moto_db_data:

@@ -1,0 +1,24 @@
+# Example railway.toml — adapt service names/regions as needed.
+# This file is a helpful starting point; Railway's UI/CLI will generate
+# project-specific config when you connect the repo.
+
+[project]
+name = "wi-motos"
+
+[[services]]
+name = "backend"
+path = "."
+type = "docker"
+dockerfile = "Dockerfile"
+
+[[services]]
+name = "worker"
+path = "."
+type = "docker"
+dockerfile = "Dockerfile"
+
+[[services]]
+name = "frontend"
+path = "wi-front"
+type = "docker"
+dockerfile = "wi-front/Dockerfile"
