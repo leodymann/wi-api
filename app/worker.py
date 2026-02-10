@@ -5,6 +5,7 @@ import os
 import time
 import io
 import base64
+import json
 import requests
 from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
@@ -42,7 +43,9 @@ UPLOAD_ROOT = Path("uploads")
 
 STATE_DIR = Path(".worker_state")
 STATE_DIR.mkdir(exist_ok=True)
-OFFERS_SENT_FILE = STATE_DIR / "offers_sent_date.txt"
+
+# ✅ novo estado: controla 24/dia + 1/h e não reenviar produto
+OFFERS_STATE_FILE = STATE_DIR / "offers_state.json"
 
 
 def now_utc() -> datetime:
@@ -52,17 +55,6 @@ def now_utc() -> datetime:
 def today_local_date() -> date:
     # se seu servidor estiver em UTC e você quiser Fortaleza, ajuste aqui
     return datetime.now().date()
-
-
-def already_sent_offers_today() -> bool:
-    today = today_local_date().isoformat()
-    if not OFFERS_SENT_FILE.exists():
-        return False
-    return OFFERS_SENT_FILE.read_text(encoding="utf-8").strip() == today
-
-
-def mark_offers_sent_today() -> None:
-    OFFERS_SENT_FILE.write_text(today_local_date().isoformat(), encoding="utf-8")
 
 
 def compute_backoff_seconds(tries: int) -> int:
@@ -137,15 +129,244 @@ def _commit_row(db: Session, row) -> None:
     try:
         db.refresh(row)
     except Exception:
-        # refresh não é obrigatório, commit já garante persistência
         pass
 
 
+# ============================================================
+# ✅ OFERTAS: 24/dia + 1 por hora + só produto novo (por arquivo)
+# ============================================================
+
+def _local_now() -> datetime:
+    # Railway normalmente roda em UTC; pra regra "1 por hora" tanto faz.
+    return datetime.now()
+
+
+def _today_key() -> str:
+    return _local_now().date().isoformat()
+
+
+def load_offers_state() -> dict:
+    """
+    state:
+      {
+        "day": "YYYY-MM-DD",
+        "sent_count": 0,
+        "last_sent_at": "ISO_DATETIME" | null,
+        "sent_product_ids": [1,2,3]
+      }
+    """
+    if not OFFERS_STATE_FILE.exists():
+        return {"day": _today_key(), "sent_count": 0, "last_sent_at": None, "sent_product_ids": []}
+
+    try:
+        data = json.loads(OFFERS_STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("state not dict")
+    except Exception:
+        data = {"day": _today_key(), "sent_count": 0, "last_sent_at": None, "sent_product_ids": []}
+
+    # reseta ao virar o dia
+    if data.get("day") != _today_key():
+        data = {"day": _today_key(), "sent_count": 0, "last_sent_at": None, "sent_product_ids": []}
+
+    data.setdefault("sent_product_ids", [])
+    data.setdefault("sent_count", 0)
+    data.setdefault("last_sent_at", None)
+    data.setdefault("day", _today_key())
+    return data
+
+
+def save_offers_state(state: dict) -> None:
+    OFFERS_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+
+def can_send_offer_now(state: dict, *, min_interval_seconds: int) -> bool:
+    last = state.get("last_sent_at")
+    if not last:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(last)
+    except Exception:
+        return True
+    return (_local_now() - last_dt).total_seconds() >= float(min_interval_seconds)
+
+
+def mark_offer_sent(state: dict, product_id: int) -> None:
+    state["sent_count"] = int(state.get("sent_count", 0)) + 1
+    state["last_sent_at"] = _local_now().isoformat()
+
+    ids = state.get("sent_product_ids") or []
+    if product_id not in ids:
+        ids.append(product_id)
+    state["sent_product_ids"] = ids
+
+    save_offers_state(state)
+
+
+def image_bytes_to_data_uri_jpeg_optimized(
+    data: bytes,
+    *,
+    max_dim: int,
+    quality: int,
+    max_bytes: int,
+) -> str:
+    if not data:
+        raise BlibsendError("Imagem vazia (bytes).")
+
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img = img.convert("RGB")
+
+            w, h = img.size
+            scale = min(1.0, max_dim / float(max(w, h)))
+            if scale < 1.0:
+                img = img.resize((int(w * scale), int(h * scale)))
+
+            q = int(quality)
+            while True:
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=q, optimize=True)
+                raw = buf.getvalue()
+
+                if len(raw) <= max_bytes or q <= 35:
+                    b64 = base64.b64encode(raw).decode("utf-8")
+                    return f"data:image/jpeg;base64,{b64}"
+
+                q -= 10
+    except Exception as e:
+        raise BlibsendError(f"Falha ao processar imagem (PIL): {e}")
+
+
+def fetch_image_bytes_from_storage(image_url_or_key: str, *, timeout: int = 30) -> bytes:
+    u = (image_url_or_key or "").strip()
+    if not u:
+        raise BlibsendError("Imagem sem url/key.")
+
+    if u.startswith("http://") or u.startswith("https://"):
+        try:
+            r = requests.get(u, timeout=timeout)
+            r.raise_for_status()
+            return r.content
+        except Exception as e:
+            raise BlibsendError(f"Falha ao baixar imagem por URL: {e}")
+
+    if u.startswith("/static/"):
+        rel = u.replace("/static/", "").lstrip("/")
+        file_path = UPLOAD_ROOT / rel
+        if not file_path.exists():
+            raise BlibsendError(f"Arquivo local não encontrado: {file_path}")
+        return file_path.read_bytes()
+
+    try:
+        url = presign_get_url(u, expires_seconds=3600)
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        return r.content
+    except Exception as e:
+        raise BlibsendError(f"Falha ao baixar do S3 (key={u}): {e}")
+
+
+def process_product_offers(db: Session, group_to: str) -> int:
+    """
+    ✅ Nova regra:
+      - worker checa sempre
+      - envia no máximo 1 por vez
+      - respeita OFFERS_MAX_PER_DAY (default 24)
+      - respeita OFFERS_MIN_INTERVAL_SECONDS (default 3600 = 1h)
+      - só envia produto novo (não enviado hoje) e com imagem
+    """
+    state = load_offers_state()
+
+    max_per_day = int(os.getenv("OFFERS_MAX_PER_DAY", "24"))
+    min_interval = int(os.getenv("OFFERS_MIN_INTERVAL_SECONDS", "3600"))
+    limit_query = int(os.getenv("PRODUCTS_OFFER_LIMIT", "200"))
+
+    max_dim = int(os.getenv("OFFERS_IMAGE_MAX_DIM", "1280"))
+    quality = int(os.getenv("OFFERS_IMAGE_QUALITY", "70"))
+    max_bytes = int(os.getenv("OFFERS_IMAGE_MAX_BYTES", "850000"))
+
+    # limite diário
+    if int(state.get("sent_count", 0)) >= max_per_day:
+        print(f"[worker] offers: daily limit reached ({state.get('sent_count')}/{max_per_day})")
+        return 0
+
+    # intervalo mínimo (1h)
+    if not can_send_offer_now(state, min_interval_seconds=min_interval):
+        return 0
+
+    sent_ids = set(state.get("sent_product_ids") or [])
+
+    stmt = (
+        select(ProductORM)
+        .options(selectinload(ProductORM.images))
+        .where(ProductORM.status == ProductStatus.IN_STOCK)
+        .order_by(ProductORM.id.desc())
+        .limit(limit_query)
+    )
+
+    products = db.execute(stmt).scalars().all()
+
+    candidate: Optional[ProductORM] = None
+    cover_url: Optional[str] = None
+
+    for p in products:
+        if p.id in sent_ids:
+            continue
+        images = sorted(p.images or [], key=lambda x: x.position or 9999)
+        if not images:
+            continue
+        candidate = p
+        cover_url = images[0].url
+        break
+
+    if not candidate:
+        # nada novo pra enviar
+        return 0
+
+    p = candidate
+
+    title = (
+        "🔥 *OFERTA DO DIA 🔥*\n"
+        f"🏍️ Modelo: {p.brand} {p.model}\n"
+        f"🎨 Cor: {p.color}\n"
+        f"📆 Ano: {p.year}\n"
+        f"🛣️ Kilometragem: {p.km}km\n"
+        f"💰 *Preço: {format_brl(p.sale_price)}*\n"
+    )
+
+    try:
+        print(f"[worker] offers: downloading image for product {p.id} (url/key={cover_url})")
+        original_bytes = fetch_image_bytes_from_storage(cover_url or "")
+
+        body = image_bytes_to_data_uri_jpeg_optimized(
+            original_bytes,
+            max_dim=max_dim,
+            quality=quality,
+            max_bytes=max_bytes,
+        )
+
+        print(f"[worker] offers: sending product {p.id} to group={group_to}")
+        send_whatsapp_group_file_datauri(
+            to_group=group_to,
+            type_="image",
+            title=title,
+            body=body,
+        )
+
+        mark_offer_sent(state, p.id)
+        print(f"[worker] offers: sent product {p.id} (sent_today={state['sent_count']}/{max_per_day})")
+        return 1
+
+    except BlibsendError as e:
+        print(f"[worker] offers: FAILED product {p.id}: {e}")
+        return 0
+
+
+# ============================================================
+# resto do worker (finance + parcelas) igual
+# ============================================================
+
 def process_finance(db: Session, to_number: str) -> int:
-    """
-    Envia contas vencidas/pendentes para o dono.
-    Ao enviar: wpp_status = SENT + wpp_sent_at.
-    """
     today = today_local_date()
 
     stmt = (
@@ -172,7 +393,6 @@ def process_finance(db: Session, to_number: str) -> int:
         if not can_try(f.wpp_status, f.wpp_next_retry_at):
             continue
 
-        # marca como SENDING antes de enviar (evita duplicidade)
         f.wpp_status = WppSendStatus.SENDING
         db.flush()
         _commit_row(db, f)
@@ -212,10 +432,6 @@ def process_finance(db: Session, to_number: str) -> int:
 
 
 def process_installments_due_soon(db: Session, to_number: str) -> int:
-    """
-    Envia lembrete X dias antes do vencimento.
-    Ao enviar: wa_due_status = SENT + wa_due_sent_at.
-    """
     days = int(os.getenv("PROMISSORY_REMINDER_DAYS", "5"))
     today = today_local_date()
     target = today + timedelta(days=days)
@@ -305,10 +521,6 @@ def process_installments_due_soon(db: Session, to_number: str) -> int:
 
 
 def process_installments_overdue(db: Session, to_number: str) -> int:
-    """
-    Envia alerta de parcela atrasada.
-    Ao enviar: wa_overdue_status = SENT + wa_overdue_sent_at.
-    """
     today = today_local_date()
 
     stmt = (
@@ -393,145 +605,6 @@ def process_installments_overdue(db: Session, to_number: str) -> int:
     return sent
 
 
-def image_bytes_to_data_uri_jpeg_optimized(
-    data: bytes,
-    *,
-    max_dim: int,
-    quality: int,
-    max_bytes: int,
-) -> str:
-    if not data:
-        raise BlibsendError("Imagem vazia (bytes).")
-
-    try:
-        with Image.open(io.BytesIO(data)) as img:
-            img = img.convert("RGB")
-
-            w, h = img.size
-            scale = min(1.0, max_dim / float(max(w, h)))
-            if scale < 1.0:
-                img = img.resize((int(w * scale), int(h * scale)))
-
-            q = int(quality)
-            while True:
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=q, optimize=True)
-                raw = buf.getvalue()
-
-                if len(raw) <= max_bytes or q <= 35:
-                    b64 = base64.b64encode(raw).decode("utf-8")
-                    return f"data:image/jpeg;base64,{b64}"
-
-                q -= 10
-    except Exception as e:
-        raise BlibsendError(f"Falha ao processar imagem (PIL): {e}")
-
-
-def fetch_image_bytes_from_storage(image_url_or_key: str, *, timeout: int = 30) -> bytes:
-    u = (image_url_or_key or "").strip()
-    if not u:
-        raise BlibsendError("Imagem sem url/key.")
-
-    if u.startswith("http://") or u.startswith("https://"):
-        try:
-            r = requests.get(u, timeout=timeout)
-            r.raise_for_status()
-            return r.content
-        except Exception as e:
-            raise BlibsendError(f"Falha ao baixar imagem por URL: {e}")
-
-    if u.startswith("/static/"):
-        rel = u.replace("/static/", "").lstrip("/")
-        file_path = UPLOAD_ROOT / rel
-        if not file_path.exists():
-            raise BlibsendError(f"Arquivo local não encontrado: {file_path}")
-        return file_path.read_bytes()
-
-    try:
-        url = presign_get_url(u, expires_seconds=3600)
-        r = requests.get(url, timeout=timeout)
-        r.raise_for_status()
-        return r.content
-    except Exception as e:
-        raise BlibsendError(f"Falha ao baixar do S3 (key={u}): {e}")
-
-
-def process_daily_product_offers(db: Session, group_to: str) -> int:
-    limit_query = int(os.getenv("PRODUCTS_OFFER_LIMIT", "20"))
-    max_per_day = int(os.getenv("OFFERS_MAX_PER_DAY", "5"))
-    interval_s = int(os.getenv("OFFERS_SEND_INTERVAL_SECONDS", "8"))
-
-    max_dim = int(os.getenv("OFFERS_IMAGE_MAX_DIM", "1280"))
-    quality = int(os.getenv("OFFERS_IMAGE_QUALITY", "70"))
-    max_bytes = int(os.getenv("OFFERS_IMAGE_MAX_BYTES", "850000"))
-
-    stmt = (
-        select(ProductORM)
-        .options(selectinload(ProductORM.images))
-        .where(ProductORM.status == ProductStatus.IN_STOCK)
-        .order_by(ProductORM.id.desc())
-        .limit(limit_query)
-    )
-
-    products = db.execute(stmt).scalars().all()
-    print(
-        f"[worker] offers: found {len(products)} products IN_STOCK "
-        f"(query_limit={limit_query}, max_per_day={max_per_day}, interval={interval_s}s)"
-    )
-
-    sent = 0
-    for p in products:
-        if sent >= max_per_day:
-            print(f"[worker] offers: reached max_per_day={max_per_day}, stopping")
-            break
-
-        images = sorted(p.images or [], key=lambda x: x.position or 9999)
-        if not images:
-            print(f"[worker] offers: product {p.id} has no images, skipping")
-            continue
-
-        cover = images[0]
-
-        title = (
-            "🔥 *OFERTA DO DIA 🔥*\n"
-            f"🏍️ Modelo: {p.brand} {p.model}\n"
-            f"🎨 Cor: {p.color}\n"
-            f"📆 Ano: {p.year}\n"
-            f"🛣️ Kilometragem: {p.km}km\n"
-            f"💰 *Preço: {format_brl(p.sale_price)}*\n"
-        )
-
-        try:
-            print(f"[worker] offers: downloading image for product {p.id} (url/key={cover.url})")
-            original_bytes = fetch_image_bytes_from_storage(cover.url)
-
-            body = image_bytes_to_data_uri_jpeg_optimized(
-                original_bytes,
-                max_dim=max_dim,
-                quality=quality,
-                max_bytes=max_bytes,
-            )
-
-            print(f"[worker] offers: sending product {p.id} to group={group_to}")
-            send_whatsapp_group_file_datauri(
-                to_group=group_to,
-                type_="image",
-                title=title,
-                body=body,
-            )
-            sent += 1
-            print(f"[worker] offers: sent={sent}/{max_per_day}")
-
-            if interval_s > 0:
-                time.sleep(interval_s)
-
-        except BlibsendError as e:
-            print(f"[worker] offers: FAILED product {p.id}: {e}")
-
-    print(f"[worker] offers: sent total={sent}")
-    return sent
-
-
 def run_loop() -> None:
     to_number = os.getenv("BLIBSEND_DEFAULT_TO", "").strip()
     if not to_number:
@@ -544,22 +617,20 @@ def run_loop() -> None:
     interval = int(os.getenv("WORKER_INTERVAL_SECONDS", "30"))
     days = int(os.getenv("PROMISSORY_REMINDER_DAYS", "5"))
 
-    offer_hour = int(os.getenv("PRODUCTS_OFFER_HOUR", "9"))
-    offer_limit = int(os.getenv("PRODUCTS_OFFER_LIMIT", "20"))
-    offer_interval = int(os.getenv("OFFERS_SEND_INTERVAL_SECONDS", "8"))
-    offer_max = int(os.getenv("OFFERS_MAX_PER_DAY", "5"))
+    max_per_day = int(os.getenv("OFFERS_MAX_PER_DAY", "24"))
+    min_interval = int(os.getenv("OFFERS_MIN_INTERVAL_SECONDS", "3600"))
+    limit_query = int(os.getenv("PRODUCTS_OFFER_LIMIT", "200"))
 
     print(
         f"[worker] started. interval={interval}s to={to_number} due_soon_days={days} "
-        f"offers_hour={offer_hour} offers_limit={offer_limit} offers_interval={offer_interval}s "
-        f"offers_max={offer_max} group_to={group_to}"
+        f"offers_max_per_day={max_per_day} offers_min_interval={min_interval}s "
+        f"products_query_limit={limit_query} group_to={group_to}"
     )
 
     while True:
         started = time.time()
 
         with SessionLocal() as db:
-            # ✅ isola cada bloco: erro em um não desfaz os outros
             a = b = c = d = 0
 
             try:
@@ -581,23 +652,11 @@ def run_loop() -> None:
                 print(f"[worker] ERROR process_installments_overdue: {e}")
 
             try:
-                now_local = datetime.now()
-                sent_today = already_sent_offers_today()
-                print(f"[worker] offers check: now={now_local} offer_hour={offer_hour} sent_today={sent_today}")
-
-                if now_local.hour >= offer_hour and not sent_today:
-                    print("[worker] offers: starting...")
-                    d = process_daily_product_offers(db, group_to)
-
-                    if d > 0:
-                        mark_offers_sent_today()
-                        print("[worker] offers: locked day (sent_today=True)")
-                    else:
-                        print("[worker] offers: nothing sent, NOT locking the day")
-
+                # ✅ checa sempre (a função controla 1h + 24/dia + novo produto)
+                d = process_product_offers(db, group_to)
             except Exception as e:
                 db.rollback()
-                print(f"[worker] ERROR process_daily_product_offers: {e}")
+                print(f"[worker] ERROR process_product_offers: {e}")
 
             if a or b or c or d:
                 print(f"[worker] sent finance={a} due_soon_installments={c} overdue_installments={b} offers={d}")
@@ -612,4 +671,3 @@ if __name__ == "__main__":
         run_loop()
     except KeyboardInterrupt:
         print("[worker] stopped (Ctrl+C)")
-
