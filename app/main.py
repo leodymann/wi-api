@@ -39,12 +39,13 @@ app = FastAPI(title="Moto Store API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS_LIST,
+    allow_origins=ALLOW_ORIGINS_LIST,  # mantém lista fixa p/ produção
+    allow_origin_regex=os.getenv("CORS_ORIGIN_REGEX"),  # regex opcional
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"]
 )
+
 print("[CORS] allow_origins =", ALLOW_ORIGINS_LIST)
 
 @app.on_event("startup")
@@ -68,3 +69,4 @@ app.include_router(finance_router, prefix="/finance", tags=["finance"])
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 #app.include_router(test, prefix="/test", tags=["test"])
 app.include_router(health_router, tags=["health"])
+
