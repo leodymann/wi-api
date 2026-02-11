@@ -30,11 +30,12 @@ if _env_origins:
     ALLOW_ORIGINS_LIST = [o.strip() for o in _env_origins.split(",") if o.strip()]
 else:
     ALLOW_ORIGINS_LIST = [
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ]
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://tauri.localhost",
+]
 
 app = FastAPI(title="Moto Store API")
 
@@ -77,6 +78,7 @@ app.include_router(finance_router, prefix="/finance", tags=["finance"])
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 #app.include_router(test, prefix="/test", tags=["test"])
 app.include_router(health_router, tags=["health"])
+
 
 
 
