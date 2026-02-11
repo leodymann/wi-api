@@ -43,8 +43,9 @@ UPLOAD_ROOT = Path("uploads")
 STATE_DIR = Path(".worker_state")
 STATE_DIR.mkdir(exist_ok=True)
 
-# ✅ ofertas: controla envio por janela + intervalo (1h)
+# ✅ ofertas: controla envio por janela + intervalo (1h) + rodízio de produto
 OFFERS_LAST_SENT_FILE = STATE_DIR / "offers_last_sent_at.txt"
+OFFERS_LAST_PRODUCT_FILE = STATE_DIR / "offers_last_product_id.txt"
 
 
 def now_utc() -> datetime:
@@ -163,6 +164,22 @@ def _write_last_offers_sent_at(dt_utc: datetime) -> None:
     if dt_utc.tzinfo is None:
         dt_utc = dt_utc.replace(tzinfo=timezone.utc)
     OFFERS_LAST_SENT_FILE.write_text(str(dt_utc.timestamp()), encoding="utf-8")
+
+
+def _read_last_offers_product_id() -> Optional[int]:
+    if not OFFERS_LAST_PRODUCT_FILE.exists():
+        return None
+    raw = OFFERS_LAST_PRODUCT_FILE.read_text(encoding="utf-8").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+
+def _write_last_offers_product_id(product_id: int) -> None:
+    OFFERS_LAST_PRODUCT_FILE.write_text(str(int(product_id)), encoding="utf-8")
 
 
 def offers_window_open(now_local: datetime, start_h: int, end_h: int) -> bool:
@@ -474,14 +491,21 @@ def fetch_image_bytes_from_storage(image_url_or_key: str, *, timeout: int = 30) 
         raise BlibsendError(f"Falha ao baixar do S3 (key={u}): {e}")
 
 
-def process_daily_product_offers(db: Session, group_to: str) -> int:
+def process_daily_product_offers(db: Session, group_to: str) -> tuple[int, Optional[int]]:
+    """
+    Envia ofertas para o grupo.
+    ✅ Rodízio: tenta não repetir o último product_id enviado.
+    Retorna: (sent_count, last_sent_product_id)
+    """
     limit_query = int(os.getenv("PRODUCTS_OFFER_LIMIT", "20"))
-    max_per_day = int(os.getenv("OFFERS_MAX_PER_DAY", "5"))
-    interval_s = int(os.getenv("OFFERS_SEND_INTERVAL_SECONDS", "8"))
+    max_per_run = int(os.getenv("OFFERS_MAX_PER_DAY", "1"))  # aqui você já está usando como "por execução"
+    interval_s = int(os.getenv("OFFERS_SEND_INTERVAL_SECONDS", "0"))
 
     max_dim = int(os.getenv("OFFERS_IMAGE_MAX_DIM", "1280"))
     quality = int(os.getenv("OFFERS_IMAGE_QUALITY", "70"))
     max_bytes = int(os.getenv("OFFERS_IMAGE_MAX_BYTES", "850000"))
+
+    last_sent_pid = _read_last_offers_product_id()
 
     stmt = (
         select(ProductORM)
@@ -494,18 +518,35 @@ def process_daily_product_offers(db: Session, group_to: str) -> int:
     products = db.execute(stmt).scalars().all()
     print(
         f"[worker] offers: found {len(products)} products IN_STOCK "
-        f"(query_limit={limit_query}, max_per_day={max_per_day}, interval={interval_s}s)"
+        f"(query_limit={limit_query}, max_per_run={max_per_run}, interval={interval_s}s, last_product_id={last_sent_pid})"
     )
 
+    # escolhe o primeiro produto que não seja o último enviado
+    def pick_next_product() -> Optional[ProductORM]:
+        if not products:
+            return None
+        if last_sent_pid is None:
+            return products[0]
+        for p in products:
+            if p.id != last_sent_pid:
+                return p
+        # se só tem o mesmo, manda ele mesmo
+        return products[0]
+
     sent = 0
-    for p in products:
-        if sent >= max_per_day:
-            print(f"[worker] offers: reached max_per_day={max_per_day}, stopping")
+    last_sent_this_run: Optional[int] = None
+
+    while sent < max_per_run:
+        p = pick_next_product()
+        if p is None:
             break
 
         images = sorted(p.images or [], key=lambda x: x.position or 9999)
         if not images:
             print(f"[worker] offers: product {p.id} has no images, skipping")
+            # marca como "já tentou" para evitar loop infinito no mesmo produto sem imagem
+            # remove esse produto da lista local
+            products[:] = [x for x in products if x.id != p.id]
             continue
 
         cover = images[0]
@@ -538,17 +579,26 @@ def process_daily_product_offers(db: Session, group_to: str) -> int:
                 body=body,
             )
             print(f"[worker] offers: blibsend_resp product_id={p.id} resp={str(resp)[:1500]}")
+
             sent += 1
-            print(f"[worker] offers: sent={sent}/{max_per_day}")
+            last_sent_this_run = p.id
+            print(f"[worker] offers: sent={sent}/{max_per_run}")
+
+            # atualiza “último enviado” para a próxima escolha no mesmo run (se max_per_run > 1)
+            last_sent_pid = p.id
 
             if interval_s > 0:
                 time.sleep(interval_s)
 
         except Exception as e:
             print(f"[worker] offers: FAILED product {p.id}: {repr(e)}")
+            # remove esse produto para tentar outro no mesmo run (se existir)
+            products[:] = [x for x in products if x.id != p.id]
+            if not products:
+                break
 
     print(f"[worker] offers: sent total={sent}")
-    return sent
+    return sent, last_sent_this_run
 
 
 def run_loop() -> None:
@@ -564,8 +614,8 @@ def run_loop() -> None:
     days = int(os.getenv("PROMISSORY_REMINDER_DAYS", "5"))
 
     offer_limit = int(os.getenv("PRODUCTS_OFFER_LIMIT", "20"))
-    offer_interval = int(os.getenv("OFFERS_SEND_INTERVAL_SECONDS", "8"))
-    offer_max = int(os.getenv("OFFERS_MAX_PER_DAY", "5"))
+    offer_interval = int(os.getenv("OFFERS_SEND_INTERVAL_SECONDS", "0"))
+    offer_max = int(os.getenv("OFFERS_MAX_PER_DAY", "1"))
 
     # ✅ 07h até 22h (22h para) + intervalo mínimo 1h
     offers_start = int(os.getenv("OFFERS_START_HOUR", "7"))
@@ -605,7 +655,9 @@ def run_loop() -> None:
 
             try:
                 now_local = datetime.now()
-                last = _read_last_offers_sent_at()
+                last_at = _read_last_offers_sent_at()
+                last_pid = _read_last_offers_product_id()
+
                 can_send = can_send_offers_now(
                     now_local=now_local,
                     start_h=offers_start,
@@ -616,16 +668,18 @@ def run_loop() -> None:
 
                 print(
                     f"[worker] offers check: now={now_local} window={offers_start}-{offers_end} "
-                    f"in_window={in_window} last_sent_at={last} can_send={can_send}"
+                    f"in_window={in_window} last_sent_at={last_at} can_send={can_send} last_product_id={last_pid}"
                 )
 
                 if can_send:
                     print("[worker] offers: starting...")
-                    d = process_daily_product_offers(db, group_to)
+                    d, sent_pid = process_daily_product_offers(db, group_to)
 
                     if d > 0:
                         _write_last_offers_sent_at(now_utc())
-                        print("[worker] offers: saved last_sent_at")
+                        if sent_pid is not None:
+                            _write_last_offers_product_id(sent_pid)
+                        print(f"[worker] offers: saved last_sent_at (and last_product_id={sent_pid})")
                     else:
                         print("[worker] offers: nothing sent, NOT updating last_sent_at")
 
