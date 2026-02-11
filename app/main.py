@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Request
 from pathlib import Path
 import os
 
@@ -76,6 +77,7 @@ app.include_router(finance_router, prefix="/finance", tags=["finance"])
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 #app.include_router(test, prefix="/test", tags=["test"])
 app.include_router(health_router, tags=["health"])
+
 
 
 
