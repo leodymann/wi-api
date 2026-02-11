@@ -45,7 +45,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
+@app.middleware("http")
+async def log_preflight(request: Request, call_next):
+    if request.method == "OPTIONS":
+        print("[PRE-FLIGHT] path =", request.url.path)
+        print("[PRE-FLIGHT] origin =", request.headers.get("origin"))
+        print("[PRE-FLIGHT] acrm =", request.headers.get("access-control-request-method"))
+        print("[PRE-FLIGHT] acrh =", request.headers.get("access-control-request-headers"))
+    return await call_next(request)
 print("[CORS] allow_origins =", ALLOW_ORIGINS_LIST)
 
 @app.on_event("startup")
@@ -69,5 +76,6 @@ app.include_router(finance_router, prefix="/finance", tags=["finance"])
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 #app.include_router(test, prefix="/test", tags=["test"])
 app.include_router(health_router, tags=["health"])
+
 
 
