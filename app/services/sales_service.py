@@ -347,11 +347,19 @@ def pay_installment(
     inst.status = InstallmentStatus.PAID
     inst.paid_at = datetime.utcnow()
     inst.paid_amount = amount_to_pay
-
     db.flush()
 
+    # ✅ se todas as parcelas da promissória estiverem pagas:
     if all(i.status == InstallmentStatus.PAID for i in prom.installments):
         prom.status = PromissoryStatus.PAID
         db.flush()
 
+        # ✅ marca a venda como CONFIRMED (quitada, segundo sua regra)
+        sale = prom.sale  # relationship 0..1 já existe
+        if sale and sale.status != SaleStatus.CANCELED:
+            sale.status = SaleStatus.CONFIRMED
+            db.flush()
+
     return inst
+
+
