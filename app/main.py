@@ -64,7 +64,7 @@ def ensure_admin() -> None:
     Controlado por env vars (recomendado no Railway).
     """
     admin_email = os.getenv("ADMIN_EMAIL", "admin@admin.com").strip().lower()
-    admin_password = os.getenv("ADMIN_PASSWORD", "admin123").strip()
+    admin_password = os.getenv("ADMIN_PASSWORD", "leo1idealdeveloper2admin3acess").strip()
     admin_name = os.getenv("ADMIN_NAME", "Admin").strip()
 
     db = SessionLocal()
@@ -109,3 +109,4 @@ app.include_router(users_router, prefix="/users", tags=["users"])
 app.include_router(finance_router, prefix="/finance", tags=["finance"])
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(health_router, tags=["health"])
+
