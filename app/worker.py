@@ -8,7 +8,7 @@ import base64
 import requests
 from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional
 from decimal import Decimal, ROUND_HALF_UP
 
 from dotenv import load_dotenv
@@ -42,10 +42,7 @@ UPLOAD_ROOT = Path("uploads")
 
 STATE_DIR = Path(".worker_state")
 STATE_DIR.mkdir(exist_ok=True)
-
-# ✅ ofertas: controla envio por janela + intervalo (1h) + rodízio de produto
-OFFERS_LAST_SENT_FILE = STATE_DIR / "offers_last_sent_at.txt"
-OFFERS_LAST_PRODUCT_FILE = STATE_DIR / "offers_last_product_id.txt"
+OFFERS_SENT_FILE = STATE_DIR / "offers_sent_date.txt"
 
 
 def now_utc() -> datetime:
@@ -55,6 +52,17 @@ def now_utc() -> datetime:
 def today_local_date() -> date:
     # se seu servidor estiver em UTC e você quiser Fortaleza, ajuste aqui
     return datetime.now().date()
+
+
+def already_sent_offers_today() -> bool:
+    today = today_local_date().isoformat()
+    if not OFFERS_SENT_FILE.exists():
+        return False
+    return OFFERS_SENT_FILE.read_text(encoding="utf-8").strip() == today
+
+
+def mark_offers_sent_today() -> None:
+    OFFERS_SENT_FILE.write_text(today_local_date().isoformat(), encoding="utf-8")
 
 
 def compute_backoff_seconds(tries: int) -> int:
@@ -87,7 +95,7 @@ def mark_failed_generic(
     next_retry_field: str,
     err: str,
 ) -> None:
-    tries = int(getattr(row, tries_field) or 0) + 1
+    tries = int(getattr(row, tries_field, 0) or 0) + 1
     setattr(row, tries_field, tries)
     setattr(row, status_field, WppSendStatus.FAILED)
     setattr(row, error_field, err[:500])
@@ -120,7 +128,27 @@ def format_br_phone(phone: str) -> str:
     return phone or "-"
 
 
+def phone_to_blibsend_to(phone: str) -> str:
+    """
+    Converte telefone salvo no banco para formato esperado no envio.
+    Retorna algo tipo: 55DDDNXXXXXXXX ou 55DDDNXXXXXXX
+    """
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if not digits:
+        return ""
+    if digits.startswith("55") and len(digits) >= 12:
+        return digits
+    # se veio com DDD+numero (10/11)
+    if len(digits) in (10, 11):
+        return "55" + digits
+    return digits  # fallback
+
+
 def _commit_row(db: Session, row) -> None:
+    """
+    Commita logo após atualizar SENT/FAILED para não perder status
+    se outra parte do loop der erro e fizer rollback.
+    """
     db.commit()
     try:
         db.refresh(row)
@@ -128,78 +156,11 @@ def _commit_row(db: Session, row) -> None:
         pass
 
 
-def _send_text_with_logs(*, to_number: str, body: str, context: str) -> Any:
-    try:
-        resp = send_whatsapp_text(to=to_number, body=body)
-        preview = resp
-        try:
-            txt = str(resp)
-            if len(txt) > 1500:
-                preview = txt[:1500] + "…(trunc)"
-        except Exception:
-            preview = resp
-        print(f"[worker] {context}: send_whatsapp_text OK to={to_number} resp={preview}")
-        return resp
-    except Exception as e:
-        print(f"[worker] {context}: send_whatsapp_text FAILED to={to_number} err={repr(e)}")
-        raise
-
-
-# ---------------------------
-# ✅ Ofertas: janela 07h-22h + intervalo mínimo 1h
-# ---------------------------
-def _read_last_offers_sent_at() -> Optional[datetime]:
-    if not OFFERS_LAST_SENT_FILE.exists():
-        return None
-    raw = OFFERS_LAST_SENT_FILE.read_text(encoding="utf-8").strip()
-    if not raw:
-        return None
-    try:
-        return datetime.fromtimestamp(float(raw), tz=timezone.utc)
-    except Exception:
-        return None
-
-
-def _write_last_offers_sent_at(dt_utc: datetime) -> None:
-    if dt_utc.tzinfo is None:
-        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-    OFFERS_LAST_SENT_FILE.write_text(str(dt_utc.timestamp()), encoding="utf-8")
-
-
-def _read_last_offers_product_id() -> Optional[int]:
-    if not OFFERS_LAST_PRODUCT_FILE.exists():
-        return None
-    raw = OFFERS_LAST_PRODUCT_FILE.read_text(encoding="utf-8").strip()
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except Exception:
-        return None
-
-
-def _write_last_offers_product_id(product_id: int) -> None:
-    OFFERS_LAST_PRODUCT_FILE.write_text(str(int(product_id)), encoding="utf-8")
-
-
-def offers_window_open(now_local: datetime, start_h: int, end_h: int) -> bool:
-    # janela [start_h, end_h) -> envia a partir de start_h e para antes de end_h
-    return start_h <= now_local.hour < end_h
-
-
-def can_send_offers_now(*, now_local: datetime, start_h: int, end_h: int, min_interval_s: int) -> bool:
-    if not offers_window_open(now_local, start_h, end_h):
-        return False
-
-    last = _read_last_offers_sent_at()
-    if last is None:
-        return True
-
-    nowu = now_utc()
-    return (nowu - last).total_seconds() >= float(min_interval_s)
-
-
 def process_finance(db: Session, to_number: str) -> int:
+    """
+    Envia contas vencidas/pendentes para o dono.
+    Ao enviar: wpp_status = SENT + wpp_sent_at.
+    """
     today = today_local_date()
 
     stmt = (
@@ -209,7 +170,10 @@ def process_finance(db: Session, to_number: str) -> int:
                 FinanceORM.status == FinanceStatus.PENDING,
                 FinanceORM.due_date <= today,
                 or_(FinanceORM.wpp_status.is_(None), FinanceORM.wpp_status != WppSendStatus.SENT),
-                or_(FinanceORM.wpp_next_retry_at.is_(None), FinanceORM.wpp_next_retry_at <= now_utc()),
+                or_(
+                    FinanceORM.wpp_next_retry_at.is_(None),
+                    FinanceORM.wpp_next_retry_at <= now_utc(),
+                ),
             )
         )
         .order_by(FinanceORM.due_date.asc(), FinanceORM.id.asc())
@@ -223,6 +187,10 @@ def process_finance(db: Session, to_number: str) -> int:
         if not can_try(f.wpp_status, f.wpp_next_retry_at):
             continue
 
+        f.wpp_status = WppSendStatus.SENDING
+        db.flush()
+        _commit_row(db, f)
+
         msg = (
             "*📌 Novo Conta Adicionada!!!*\n"
             f"🏦 Empresa: {f.company}\n"
@@ -230,11 +198,8 @@ def process_finance(db: Session, to_number: str) -> int:
             f"📆 Venc.: {f.due_date}\n"
         )
 
-        f.wpp_status = WppSendStatus.SENDING
-        db.flush()
-
         try:
-            _send_text_with_logs(to_number=to_number, body=msg, context=f"finance id={f.id}")
+            send_whatsapp_text(to=to_number, body=msg)
 
             f.wpp_status = WppSendStatus.SENT
             f.wpp_sent_at = now_utc()
@@ -245,7 +210,7 @@ def process_finance(db: Session, to_number: str) -> int:
             db.flush()
             _commit_row(db, f)
 
-        except Exception as e:
+        except BlibsendError as e:
             mark_failed_generic(
                 row=f,
                 tries_field="wpp_tries",
@@ -261,6 +226,10 @@ def process_finance(db: Session, to_number: str) -> int:
 
 
 def process_installments_due_soon(db: Session, to_number: str) -> int:
+    """
+    Envia lembrete X dias antes do vencimento (para o dono).
+    Ao enviar: wa_due_status = SENT + wa_due_sent_at.
+    """
     days = int(os.getenv("PROMISSORY_REMINDER_DAYS", "5"))
     today = today_local_date()
     target = today + timedelta(days=days)
@@ -279,7 +248,10 @@ def process_installments_due_soon(db: Session, to_number: str) -> int:
                 InstallmentORM.status == InstallmentStatus.PENDING,
                 InstallmentORM.due_date == target,
                 or_(InstallmentORM.wa_due_status.is_(None), InstallmentORM.wa_due_status != WppSendStatus.SENT),
-                or_(InstallmentORM.wa_due_next_retry_at.is_(None), InstallmentORM.wa_due_next_retry_at <= now_utc()),
+                or_(
+                    InstallmentORM.wa_due_next_retry_at.is_(None),
+                    InstallmentORM.wa_due_next_retry_at <= now_utc(),
+                ),
             )
         )
         .order_by(InstallmentORM.due_date.asc(), InstallmentORM.id.asc())
@@ -292,6 +264,10 @@ def process_installments_due_soon(db: Session, to_number: str) -> int:
     for inst in rows:
         if not can_try(inst.wa_due_status, inst.wa_due_next_retry_at):
             continue
+
+        inst.wa_due_status = WppSendStatus.SENDING
+        db.flush()
+        _commit_row(db, inst)
 
         prom = inst.promissory
         client = prom.client if prom else None
@@ -309,7 +285,7 @@ def process_installments_due_soon(db: Session, to_number: str) -> int:
         due_str = inst.due_date.strftime("%d/%m/%Y")
 
         msg = (
-            "📅 *Lembrete de Vencimento*\n"
+            "📅 Lembrete!!!\n"
             f"👤 Cliente: {client_name}\n"
             f"📞 Telefone: {client_phone}\n"
             f"🏍️ Modelo: {moto_label}\n"
@@ -317,11 +293,8 @@ def process_installments_due_soon(db: Session, to_number: str) -> int:
             f"📆 Venc.: {due_str}\n"
         )
 
-        inst.wa_due_status = WppSendStatus.SENDING
-        db.flush()
-
         try:
-            _send_text_with_logs(to_number=to_number, body=msg, context=f"due_soon inst_id={inst.id} due={due_str}")
+            send_whatsapp_text(to=to_number, body=msg)
 
             inst.wa_due_status = WppSendStatus.SENT
             inst.wa_due_sent_at = now_utc()
@@ -332,8 +305,7 @@ def process_installments_due_soon(db: Session, to_number: str) -> int:
             db.flush()
             _commit_row(db, inst)
 
-        except Exception as e:
-            print(f"[worker] due_soon: FAILED inst_id={inst.id} to={to_number} err={repr(e)}")
+        except BlibsendError as e:
             tries = int(inst.wa_due_tries or 0) + 1
             inst.wa_due_tries = tries
             inst.wa_due_status = WppSendStatus.FAILED
@@ -346,7 +318,143 @@ def process_installments_due_soon(db: Session, to_number: str) -> int:
     return sent
 
 
+def process_installments_due_today_to_client(db: Session) -> int:
+    """
+    ✅ NOVO:
+    No DIA do vencimento (D0), manda msg pro CLIENTE com chave Pix + valor.
+    Para evitar duplicidade, usa campos:
+      - wa_due_today_status / wa_due_today_sent_at / wa_due_today_tries / wa_due_today_next_retry_at / wa_due_today_last_error
+
+    Se suas colunas ainda não existem, o envio funciona,
+    mas você deve criar as colunas para não reenviar em loops.
+    """
+    enabled = os.getenv("DUE_TODAY_SEND_ENABLED", "1").strip() in ("1", "true", "True")
+    if not enabled:
+        return 0
+
+    pix_key = (os.getenv("PIX_KEY") or "").strip()
+    pix_receiver = (os.getenv("PIX_RECEIVER_NAME") or "Wesley Motos").strip()
+    pix_prefix = (os.getenv("PIX_MESSAGE_PREFIX") or "Pagamento parcela").strip()
+
+    if not pix_key:
+        print("[worker] DUE_TODAY: PIX_KEY não configurado, pulando.")
+        return 0
+
+    today = today_local_date()
+
+    stmt = (
+        select(InstallmentORM)
+        .options(
+            selectinload(InstallmentORM.promissory).selectinload(PromissoryORM.client),
+            selectinload(InstallmentORM.promissory).selectinload(PromissoryORM.product),
+            selectinload(InstallmentORM.promissory)
+            .selectinload(PromissoryORM.sale)
+            .selectinload(SaleORM.product),
+        )
+        .where(
+            and_(
+                InstallmentORM.status == InstallmentStatus.PENDING,
+                InstallmentORM.due_date == today,
+            )
+        )
+        .order_by(InstallmentORM.id.asc())
+        .limit(300)
+    )
+
+    rows = db.execute(stmt).scalars().all()
+    sent = 0
+
+    # campos do "due today" (podem ainda não existir no seu ORM)
+    STATUS = "wa_due_today_status"
+    SENT_AT = "wa_due_today_sent_at"
+    TRIES = "wa_due_today_tries"
+    LAST_ERR = "wa_due_today_last_error"
+    NEXT_RETRY = "wa_due_today_next_retry_at"
+
+    for inst in rows:
+        prom = inst.promissory
+        client = prom.client if prom else None
+        if not client:
+            continue
+
+        client_to = phone_to_blibsend_to(client.phone or "")
+        if not client_to:
+            continue
+
+        status = getattr(inst, STATUS, None)
+        next_retry = getattr(inst, NEXT_RETRY, None)
+
+        if not can_try(status, next_retry):
+            continue
+
+        # marca SENDING (se campo existir)
+        if hasattr(inst, STATUS):
+            setattr(inst, STATUS, WppSendStatus.SENDING)
+            db.flush()
+            _commit_row(db, inst)
+
+        product = None
+        if prom is not None:
+            product = prom.product
+            if product is None and prom.sale is not None:
+                product = prom.sale.product
+
+        moto_label = f"{product.brand} {product.model} ({product.year})" if product else "sua compra"
+        due_str = inst.due_date.strftime("%d/%m/%Y")
+        client_name = (client.name or "").strip() or "Cliente"
+
+        # mensagem pro cliente (simples e direta)
+        msg = (
+            f"Olá, {client_name}! 👋\n"
+            f"Hoje ({due_str}) vence sua parcela de {moto_label}.\n\n"
+            f"💰 Valor: *{format_brl(inst.amount)}*\n"
+            f"🔑 Chave Pix: `{pix_key}`\n"
+            f"👤 Favorecido: {pix_receiver}\n"
+            f"📝 Descrição: {pix_prefix} {moto_label} ({due_str})\n\n"
+            "Assim que pagar, responda com o comprovante. Obrigado!"
+        )
+
+        try:
+            send_whatsapp_text(to=client_to, body=msg)
+
+            # marca SENT (se campo existir)
+            if hasattr(inst, STATUS):
+                setattr(inst, STATUS, WppSendStatus.SENT)
+                if hasattr(inst, SENT_AT):
+                    setattr(inst, SENT_AT, now_utc())
+                if hasattr(inst, LAST_ERR):
+                    setattr(inst, LAST_ERR, None)
+                if hasattr(inst, NEXT_RETRY):
+                    setattr(inst, NEXT_RETRY, None)
+                db.flush()
+                _commit_row(db, inst)
+
+            sent += 1
+
+        except BlibsendError as e:
+            # marca FAILED com retry (se campo existir)
+            if hasattr(inst, STATUS):
+                tries = int(getattr(inst, TRIES, 0) or 0) + 1
+                if hasattr(inst, TRIES):
+                    setattr(inst, TRIES, tries)
+                setattr(inst, STATUS, WppSendStatus.FAILED)
+                if hasattr(inst, LAST_ERR):
+                    setattr(inst, LAST_ERR, str(e)[:500])
+                if hasattr(inst, NEXT_RETRY):
+                    setattr(inst, NEXT_RETRY, now_utc() + timedelta(seconds=compute_backoff_seconds(tries)))
+                db.flush()
+                _commit_row(db, inst)
+            else:
+                print(f"[worker] DUE_TODAY send FAILED (no columns to persist): {e}")
+
+    return sent
+
+
 def process_installments_overdue(db: Session, to_number: str) -> int:
+    """
+    Envia alerta de parcela atrasada (para o dono).
+    Ao enviar: wa_overdue_status = SENT + wa_overdue_sent_at.
+    """
     today = today_local_date()
 
     stmt = (
@@ -363,7 +471,10 @@ def process_installments_overdue(db: Session, to_number: str) -> int:
                 InstallmentORM.status == InstallmentStatus.PENDING,
                 InstallmentORM.due_date < today,
                 or_(InstallmentORM.wa_overdue_status.is_(None), InstallmentORM.wa_overdue_status != WppSendStatus.SENT),
-                or_(InstallmentORM.wa_overdue_next_retry_at.is_(None), InstallmentORM.wa_overdue_next_retry_at <= now_utc()),
+                or_(
+                    InstallmentORM.wa_overdue_next_retry_at.is_(None),
+                    InstallmentORM.wa_overdue_next_retry_at <= now_utc(),
+                ),
             )
         )
         .order_by(InstallmentORM.due_date.asc(), InstallmentORM.id.asc())
@@ -376,6 +487,10 @@ def process_installments_overdue(db: Session, to_number: str) -> int:
     for inst in rows:
         if not can_try(inst.wa_overdue_status, inst.wa_overdue_next_retry_at):
             continue
+
+        inst.wa_overdue_status = WppSendStatus.SENDING
+        db.flush()
+        _commit_row(db, inst)
 
         prom = inst.promissory
         client = prom.client if prom else None
@@ -399,11 +514,8 @@ def process_installments_overdue(db: Session, to_number: str) -> int:
             f"💰 Parcela: {format_brl(inst.amount)} • Venc: {due_str}"
         )
 
-        inst.wa_overdue_status = WppSendStatus.SENDING
-        db.flush()
-
         try:
-            _send_text_with_logs(to_number=to_number, body=msg, context=f"overdue inst_id={inst.id} due={due_str}")
+            send_whatsapp_text(to=to_number, body=msg)
 
             inst.wa_overdue_status = WppSendStatus.SENT
             inst.wa_overdue_sent_at = now_utc()
@@ -414,8 +526,7 @@ def process_installments_overdue(db: Session, to_number: str) -> int:
             db.flush()
             _commit_row(db, inst)
 
-        except Exception as e:
-            print(f"[worker] overdue: FAILED inst_id={inst.id} to={to_number} err={repr(e)}")
+        except BlibsendError as e:
             tries = int(inst.wa_overdue_tries or 0) + 1
             inst.wa_overdue_tries = tries
             inst.wa_overdue_status = WppSendStatus.FAILED
@@ -491,21 +602,14 @@ def fetch_image_bytes_from_storage(image_url_or_key: str, *, timeout: int = 30) 
         raise BlibsendError(f"Falha ao baixar do S3 (key={u}): {e}")
 
 
-def process_daily_product_offers(db: Session, group_to: str) -> tuple[int, Optional[int]]:
-    """
-    Envia ofertas para o grupo.
-    ✅ Rodízio: tenta não repetir o último product_id enviado.
-    Retorna: (sent_count, last_sent_product_id)
-    """
+def process_daily_product_offers(db: Session, group_to: str) -> int:
     limit_query = int(os.getenv("PRODUCTS_OFFER_LIMIT", "20"))
-    max_per_run = int(os.getenv("OFFERS_MAX_PER_DAY", "1"))  # aqui você já está usando como "por execução"
-    interval_s = int(os.getenv("OFFERS_SEND_INTERVAL_SECONDS", "0"))
+    max_per_day = int(os.getenv("OFFERS_MAX_PER_DAY", "5"))
+    interval_s = int(os.getenv("OFFERS_SEND_INTERVAL_SECONDS", "8"))
 
     max_dim = int(os.getenv("OFFERS_IMAGE_MAX_DIM", "1280"))
     quality = int(os.getenv("OFFERS_IMAGE_QUALITY", "70"))
     max_bytes = int(os.getenv("OFFERS_IMAGE_MAX_BYTES", "850000"))
-
-    last_sent_pid = _read_last_offers_product_id()
 
     stmt = (
         select(ProductORM)
@@ -518,35 +622,18 @@ def process_daily_product_offers(db: Session, group_to: str) -> tuple[int, Optio
     products = db.execute(stmt).scalars().all()
     print(
         f"[worker] offers: found {len(products)} products IN_STOCK "
-        f"(query_limit={limit_query}, max_per_run={max_per_run}, interval={interval_s}s, last_product_id={last_sent_pid})"
+        f"(query_limit={limit_query}, max_per_day={max_per_day}, interval={interval_s}s)"
     )
 
-    # escolhe o primeiro produto que não seja o último enviado
-    def pick_next_product() -> Optional[ProductORM]:
-        if not products:
-            return None
-        if last_sent_pid is None:
-            return products[0]
-        for p in products:
-            if p.id != last_sent_pid:
-                return p
-        # se só tem o mesmo, manda ele mesmo
-        return products[0]
-
     sent = 0
-    last_sent_this_run: Optional[int] = None
-
-    while sent < max_per_run:
-        p = pick_next_product()
-        if p is None:
+    for p in products:
+        if sent >= max_per_day:
+            print(f"[worker] offers: reached max_per_day={max_per_day}, stopping")
             break
 
         images = sorted(p.images or [], key=lambda x: x.position or 9999)
         if not images:
             print(f"[worker] offers: product {p.id} has no images, skipping")
-            # marca como "já tentou" para evitar loop infinito no mesmo produto sem imagem
-            # remove esse produto da lista local
-            products[:] = [x for x in products if x.id != p.id]
             continue
 
         cover = images[0]
@@ -572,33 +659,23 @@ def process_daily_product_offers(db: Session, group_to: str) -> tuple[int, Optio
             )
 
             print(f"[worker] offers: sending product {p.id} to group={group_to}")
-            resp = send_whatsapp_group_file_datauri(
+            send_whatsapp_group_file_datauri(
                 to_group=group_to,
                 type_="image",
                 title=title,
                 body=body,
             )
-            print(f"[worker] offers: blibsend_resp product_id={p.id} resp={str(resp)[:1500]}")
-
             sent += 1
-            last_sent_this_run = p.id
-            print(f"[worker] offers: sent={sent}/{max_per_run}")
-
-            # atualiza “último enviado” para a próxima escolha no mesmo run (se max_per_run > 1)
-            last_sent_pid = p.id
+            print(f"[worker] offers: sent={sent}/{max_per_day}")
 
             if interval_s > 0:
                 time.sleep(interval_s)
 
-        except Exception as e:
-            print(f"[worker] offers: FAILED product {p.id}: {repr(e)}")
-            # remove esse produto para tentar outro no mesmo run (se existir)
-            products[:] = [x for x in products if x.id != p.id]
-            if not products:
-                break
+        except BlibsendError as e:
+            print(f"[worker] offers: FAILED product {p.id}: {e}")
 
     print(f"[worker] offers: sent total={sent}")
-    return sent, last_sent_this_run
+    return sent
 
 
 def run_loop() -> None:
@@ -613,82 +690,69 @@ def run_loop() -> None:
     interval = int(os.getenv("WORKER_INTERVAL_SECONDS", "30"))
     days = int(os.getenv("PROMISSORY_REMINDER_DAYS", "5"))
 
+    offer_hour = int(os.getenv("PRODUCTS_OFFER_HOUR", "9"))
     offer_limit = int(os.getenv("PRODUCTS_OFFER_LIMIT", "20"))
-    offer_interval = int(os.getenv("OFFERS_SEND_INTERVAL_SECONDS", "0"))
-    offer_max = int(os.getenv("OFFERS_MAX_PER_DAY", "1"))
-
-    # ✅ 07h até 22h (22h para) + intervalo mínimo 1h
-    offers_start = int(os.getenv("OFFERS_START_HOUR", "7"))
-    offers_end = int(os.getenv("OFFERS_END_HOUR", "22"))
-    offers_min_interval = int(os.getenv("OFFERS_MIN_INTERVAL_SECONDS", "3600"))  # 1h
+    offer_interval = int(os.getenv("OFFERS_SEND_INTERVAL_SECONDS", "8"))
+    offer_max = int(os.getenv("OFFERS_MAX_PER_DAY", "5"))
 
     print(
         f"[worker] started. interval={interval}s to={to_number} due_soon_days={days} "
-        f"offers_window={offers_start:02d}h-{offers_end:02d}h min_interval={offers_min_interval}s "
-        f"offers_limit={offer_limit} offers_interval={offer_interval}s offers_max={offer_max} "
-        f"group_to={group_to}"
+        f"offers_hour={offer_hour} offers_limit={offer_limit} offers_interval={offer_interval}s "
+        f"offers_max={offer_max} group_to={group_to}"
     )
 
     while True:
         started = time.time()
 
         with SessionLocal() as db:
-            a = b = c = d = 0
+            a = b = c = d = e = 0
 
             try:
                 a = process_finance(db, to_number)
-            except Exception as e:
+            except Exception as ex:
                 db.rollback()
-                print(f"[worker] ERROR process_finance: {repr(e)}")
+                print(f"[worker] ERROR process_finance: {ex}")
 
             try:
                 c = process_installments_due_soon(db, to_number)
-            except Exception as e:
+            except Exception as ex:
                 db.rollback()
-                print(f"[worker] ERROR process_installments_due_soon: {repr(e)}")
+                print(f"[worker] ERROR process_installments_due_soon: {ex}")
+
+            # ✅ NOVO: vencimento hoje -> cliente + pix
+            try:
+                e = process_installments_due_today_to_client(db)
+            except Exception as ex:
+                db.rollback()
+                print(f"[worker] ERROR process_installments_due_today_to_client: {ex}")
 
             try:
                 b = process_installments_overdue(db, to_number)
-            except Exception as e:
+            except Exception as ex:
                 db.rollback()
-                print(f"[worker] ERROR process_installments_overdue: {repr(e)}")
+                print(f"[worker] ERROR process_installments_overdue: {ex}")
 
             try:
-                now_local = datetime.now()
-                last_at = _read_last_offers_sent_at()
-                last_pid = _read_last_offers_product_id()
+                now_local_dt = datetime.now()
+                sent_today = already_sent_offers_today()
+                print(f"[worker] offers check: now={now_local_dt} offer_hour={offer_hour} sent_today={sent_today}")
 
-                can_send = can_send_offers_now(
-                    now_local=now_local,
-                    start_h=offers_start,
-                    end_h=offers_end,
-                    min_interval_s=offers_min_interval,
-                )
-                in_window = offers_window_open(now_local, offers_start, offers_end)
-
-                print(
-                    f"[worker] offers check: now={now_local} window={offers_start}-{offers_end} "
-                    f"in_window={in_window} last_sent_at={last_at} can_send={can_send} last_product_id={last_pid}"
-                )
-
-                if can_send:
+                if now_local_dt.hour >= offer_hour and not sent_today:
                     print("[worker] offers: starting...")
-                    d, sent_pid = process_daily_product_offers(db, group_to)
+                    d = process_daily_product_offers(db, group_to)
 
                     if d > 0:
-                        _write_last_offers_sent_at(now_utc())
-                        if sent_pid is not None:
-                            _write_last_offers_product_id(sent_pid)
-                        print(f"[worker] offers: saved last_sent_at (and last_product_id={sent_pid})")
+                        mark_offers_sent_today()
+                        print("[worker] offers: locked day (sent_today=True)")
                     else:
-                        print("[worker] offers: nothing sent, NOT updating last_sent_at")
+                        print("[worker] offers: nothing sent, NOT locking the day")
 
-            except Exception as e:
+            except Exception as ex:
                 db.rollback()
-                print(f"[worker] ERROR process_daily_product_offers: {repr(e)}")
+                print(f"[worker] ERROR process_daily_product_offers: {ex}")
 
-            if a or b or c or d:
-                print(f"[worker] sent finance={a} due_soon_installments={c} overdue_installments={b} offers={d}")
+            if a or b or c or d or e:
+                print(f"[worker] sent finance={a} due_soon_installments={c} due_today_client={e} overdue_installments={b} offers={d}")
 
         elapsed = time.time() - started
         sleep_for = max(1, interval - int(elapsed))
