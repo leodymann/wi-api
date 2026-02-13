@@ -317,6 +317,75 @@ class InstallmentORM(Base):
         Index("ix_installments_due", "due_date", "status"),
         Index("ix_installments_wpp_due", "wa_due_status", "wa_due_next_retry_at"),
         Index("ix_installments_wpp_overdue", "wa_overdue_status", "wa_overdue_next_retry_at"),
+        # ✅ novo índice pro vencimento HOJE
+        Index("ix_installments_wpp_today", "wa_today_status", "wa_today_next_retry_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    promissory_id: Mapped[int] = mapped_column(ForeignKey("promissories.id"), nullable=False)
+
+    number: Mapped[int] = mapped_column(Integer, nullable=False)
+    due_date: Mapped[date] = mapped_column(Date, nullable=False)
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+
+    status: Mapped[InstallmentStatus] = mapped_column(
+        SAEnum(InstallmentStatus, name="installment_status"),
+        nullable=False,
+        default=InstallmentStatus.PENDING,
+    )
+
+    paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    paid_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2), nullable=True)
+    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    late_days: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    late_fee_charged: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2), nullable=True)
+
+    # lembrete whatsapp "vence em breve..."
+    wa_due_status: Mapped[WppSendStatus] = mapped_column(
+        SAEnum(WppSendStatus, name="wpp_installment_due_status"),
+        nullable=False,
+        default=WppSendStatus.PENDING,
+    )
+    wa_due_tries: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    wa_due_last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    wa_due_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    wa_due_next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # cobrança quando tiver vencida
+    wa_overdue_status: Mapped[WppSendStatus] = mapped_column(
+        SAEnum(WppSendStatus, name="wpp_installment_overdue_status"),
+        nullable=False,
+        default=WppSendStatus.PENDING,
+    )
+    wa_overdue_tries: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    wa_overdue_last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    wa_overdue_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    wa_overdue_next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # ✅ NOVO: cobrança no dia do vencimento (manda pro cliente com Pix)
+    wa_today_status: Mapped[WppSendStatus] = mapped_column(
+        SAEnum(WppSendStatus, name="wpp_installment_today_status"),
+        nullable=False,
+        default=WppSendStatus.PENDING,
+    )
+    wa_today_tries: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    wa_today_last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    wa_today_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    wa_today_next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    promissory: Mapped["PromissoryORM"] = relationship(back_populates="installments")
+
+    __tablename__ = "installments"
+    __table_args__ = (
+        UniqueConstraint("promissory_id", "number", name="uq_installments_promissory_number"),
+        Index("ix_installments_due", "due_date", "status"),
+        Index("ix_installments_wpp_due", "wa_due_status", "wa_due_next_retry_at"),
+        Index("ix_installments_wpp_overdue", "wa_overdue_status", "wa_overdue_next_retry_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
