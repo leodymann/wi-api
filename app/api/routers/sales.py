@@ -35,9 +35,6 @@ def create_sale_endpoint(
     db: Session = DBSession,
     current_user=Depends(get_current_user),
 ):
-    """
-    ✅ user_id vem da sessão (current_user), não do front.
-    """
     try:
         sale, prom = create_sale(
             db,
@@ -47,11 +44,13 @@ def create_sale_endpoint(
             total=payload.total,
             discount=payload.discount,
             entry_amount=payload.entry_amount,
+
+            # ✅ NOVO
+            entry_amount_type=payload.entry_amount_type,
+
             payment_type=PaymentType(payload.payment_type),
             installments_count=payload.installments_count,
             first_due_date=payload.first_due_date,
-
-            # ✅ novos
             promissory_total=payload.promissory_total,
             daily_late_fee=payload.daily_late_fee,
         )
@@ -71,7 +70,6 @@ def create_sale_endpoint(
     if prom:
         resp["promissory"] = PromissoryOut.model_validate(prom)
     return resp
-
 
 @router.get("", response_model=dict)
 def list_sales_endpoint(
