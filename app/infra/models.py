@@ -182,14 +182,15 @@ class SaleORM(Base):
     __tablename__ = "sales"
     __table_args__ = (
         UniqueConstraint("public_id", name="uq_sales_public_id"),
-        UniqueConstraint("product_id", name="uq_sales_product_id"),  # unica venda por produto
+        UniqueConstraint("product_id", name="uq_sales_product_id"),
         Index("ix_sales_status", "status"),
         Index("ix_sales_payment_type", "payment_type"),
+        # ✅ (opcional) índice pra facilitar busca/filtro no futuro
+        Index("ix_sales_entry_amount_type", "entry_amount_type"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
-    # ex.: "MOTO-2026-000123"
     public_id: Mapped[str] = mapped_column(String(32), nullable=False)
 
     client_id: Mapped[int] = mapped_column(ForeignKey("clients.id"), nullable=False)
@@ -198,7 +199,11 @@ class SaleORM(Base):
 
     total: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     discount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+
     entry_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2), nullable=True)
+
+    # ✅ NOVO: tipo da entrada (CASH|PIX|CARD) - string pra não criar enum novo no Postgres
+    entry_amount_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
     payment_type: Mapped[PaymentType] = mapped_column(
         SAEnum(PaymentType, name="payment_type"),
