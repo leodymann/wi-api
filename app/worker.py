@@ -25,8 +25,8 @@ from app.infra.models import (
     InstallmentStatus,
     PromissoryORM,
     SaleORM,
-    SaleStatus,          # ✅ novo (pro relatório)
-    PaymentType,         # ✅ novo (pro relatório)
+    SaleStatus,
+    PaymentType,
     WppSendStatus,
     ProductORM,
     ProductStatus,
@@ -45,7 +45,9 @@ UPLOAD_ROOT = Path("uploads")
 
 STATE_DIR = Path(".worker_state")
 STATE_DIR.mkdir(exist_ok=True)
-OFFERS_SENT_FILE = STATE_DIR / "offers_sent_date.txt"
+
+# ✅ state do envio por hora (1/h entre 07 e 21)
+OFFERS_HOURLY_STATE_FILE = STATE_DIR / "offers_hourly_state.json"
 
 # ✅ anti-duplicidade do relatório semanal
 WEEKLY_REPORT_SENT_FILE = STATE_DIR / "weekly_report_sent.txt"
@@ -60,16 +62,62 @@ def today_local_date() -> date:
     return datetime.now().date()
 
 
-def already_sent_offers_today() -> bool:
-    today = today_local_date().isoformat()
-    if not OFFERS_SENT_FILE.exists():
+# ============================================================
+# ✅ CONTROLE DE OFERTAS: 1 por hora (07h->21h)
+# ============================================================
+
+def _load_offers_hourly_state() -> dict:
+    if not OFFERS_HOURLY_STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(OFFERS_HOURLY_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_offers_hourly_state(state: dict) -> None:
+    OFFERS_HOURLY_STATE_FILE.write_text(
+        json.dumps(state, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def offers_can_send_now(now_local: datetime, *, start_hour: int, end_hour: int) -> bool:
+    """
+    Permite enviar no máximo 1 oferta por hora dentro da janela [start_hour, end_hour].
+    Reseta automaticamente quando vira o dia.
+    """
+    if now_local.hour < start_hour or now_local.hour > end_hour:
         return False
-    return OFFERS_SENT_FILE.read_text(encoding="utf-8").strip() == today
+
+    state = _load_offers_hourly_state()
+    today = now_local.date().isoformat()
+
+    if state.get("date") != today:
+        # virou o dia, pode enviar
+        return True
+
+    # já enviou nesta hora?
+    if state.get("last_hour_sent") == now_local.hour:
+        return False
+
+    return True
 
 
-def mark_offers_sent_today() -> None:
-    OFFERS_SENT_FILE.write_text(today_local_date().isoformat(), encoding="utf-8")
+def mark_offers_sent_this_hour(now_local: datetime, *, product_id: Optional[int] = None) -> None:
+    state = {
+        "date": now_local.date().isoformat(),
+        "last_hour_sent": now_local.hour,
+        "sent_at_utc": now_utc().isoformat(),
+    }
+    if product_id is not None:
+        state["last_product_id"] = int(product_id)
+    _save_offers_hourly_state(state)
 
+
+# ============================================================
+# HELPERS GERAIS
+# ============================================================
 
 def compute_backoff_seconds(tries: int) -> int:
     if tries <= 0:
@@ -237,13 +285,7 @@ def weekly_mark_sent(label: str) -> None:
 
 def process_weekly_report(db: Session, to_number: str) -> int:
     """
-    Envia 1x por semana um resumo:
-      - Vendas confirmadas: bruto, desconto, líquido, entradas
-      - Por payment_type (líquido)
-      - Parcelas pagas na semana (recebimentos)
-      - Finance: contas criadas na semana + snapshot atual por status
-      - ✅ Lucro estimado: (total - desconto) - custo_snapshot
-         -> usa SaleORM.product_cost_price (snapshot)
+    Envia 1x por semana um resumo.
     """
     enabled = (os.getenv("WEEKLY_REPORT_ENABLED", "1").strip().lower() in ("1", "true", "yes"))
     if not enabled:
@@ -269,17 +311,16 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     start_dt = datetime.combine(start_d, datetime.min.time())
     end_dt = datetime.combine(end_d + timedelta(days=1), datetime.min.time())  # exclusivo
 
-    # =========================
-    # VENDAS (sales) - confirmadas na semana
-    # =========================
     q_sales_confirmed = (
         select(
             func.count(SaleORM.id),
             func.coalesce(func.sum(SaleORM.total), 0),
             func.coalesce(func.sum(SaleORM.discount), 0),
             func.coalesce(func.sum(SaleORM.entry_amount), 0),
-            # ✅ lucro estimado (usa snapshot do custo na venda)
-            func.coalesce(func.sum((SaleORM.total - SaleORM.discount) - func.coalesce(SaleORM.product_cost_price, 0)), 0),
+            func.coalesce(
+                func.sum((SaleORM.total - SaleORM.discount) - func.coalesce(SaleORM.product_cost_price, 0)),
+                0,
+            ),
         )
         .where(
             and_(
@@ -296,10 +337,8 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     sales_discount = Decimal(str(s_discount or "0"))
     sales_entry = Decimal(str(s_entry or "0"))
     sales_net = (sales_total - sales_discount).quantize(Decimal("0.01"))
-
     profit_estimated = Decimal(str(s_profit or "0")).quantize(Decimal("0.01"))
 
-    # Por tipo de pagamento (somente confirmadas) - líquido
     def sum_by_payment(pt: PaymentType) -> Decimal:
         q = (
             select(func.coalesce(func.sum(SaleORM.total - SaleORM.discount), 0))
@@ -320,7 +359,6 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     card_total = sum_by_payment(PaymentType.CARD)
     prom_total = sum_by_payment(PaymentType.PROMISSORY)
 
-    # Canceladas (só pra informação)
     q_sales_canceled = (
         select(func.count(SaleORM.id))
         .where(
@@ -333,9 +371,6 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     )
     sales_canceled_count = int(db.execute(q_sales_canceled).scalar() or 0)
 
-    # =========================
-    # RECEBIMENTOS (parcelas pagas na semana)
-    # =========================
     q_inst_paid = (
         select(
             func.count(InstallmentORM.id),
@@ -355,13 +390,8 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     installments_paid_count = int(ic or 0)
     installments_paid_amount = Decimal(str(inst_paid_amount_sum or "0"))
     installments_nominal = Decimal(str(inst_nominal_sum or "0"))
-
-    # Se paid_amount estiver NULL (caso antigo), cai pro nominal
     received_installments = installments_paid_amount if installments_paid_amount > 0 else installments_nominal
 
-    # =========================
-    # FINANCEIRO (contas)
-    # =========================
     q_fin_created = (
         select(
             func.count(FinanceORM.id),
@@ -378,7 +408,6 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     finance_created_count = int(fc or 0)
     finance_created_total = Decimal(str(fin_created_sum or "0"))
 
-    # Snapshot atual (pendente/paid/canceled)
     def fin_sum_status(st: FinanceStatus) -> Decimal:
         q = select(func.coalesce(func.sum(FinanceORM.amount), 0)).where(FinanceORM.status == st)
         v = db.execute(q).scalar()
@@ -388,9 +417,6 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     fin_paid_total = fin_sum_status(FinanceStatus.PAID)
     fin_canceled_total = fin_sum_status(FinanceStatus.CANCELED)
 
-    # =========================
-    # Mensagem WhatsApp
-    # =========================
     period = f"{start_d.strftime('%d/%m')} a {end_d.strftime('%d/%m')}"
     msg = (
         f"📊 *RELATÓRIO SEMANAL*\n"
@@ -785,6 +811,10 @@ def process_installments_overdue(db: Session, to_number: str) -> int:
     return sent
 
 
+# ============================================================
+# IMAGENS (S3/local/url) -> data URI otimizada
+# ============================================================
+
 def image_bytes_to_data_uri_jpeg_optimized(
     data: bytes,
     *,
@@ -842,15 +872,23 @@ def fetch_image_bytes_from_storage(image_url_or_key: str, *, timeout: int = 30) 
     return r.content
 
 
-def process_daily_product_offers(db: Session, group_ids: List[str]) -> int:
+# ============================================================
+# ✅ OFERTAS: 1 por hora (07h->21h), só se tiver imagem
+# ============================================================
+
+def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
+    """
+    Envia APENAS 1 produto por chamada:
+      - somente IN_STOCK
+      - somente se tiver imagem
+      - envia para todos os grupos
+    Retorna 1 se enviou, 0 se não enviou.
+    """
     if not group_ids:
         print("[worker] offers: nenhum grupo configurado, pulando.")
         return 0
 
-    limit_query = int(os.getenv("PRODUCTS_OFFER_LIMIT", "20"))
-    max_per_day = int(os.getenv("OFFERS_MAX_PER_DAY", "5"))
-    interval_s = int(os.getenv("OFFERS_SEND_INTERVAL_SECONDS", "8"))
-
+    limit_query = int(os.getenv("PRODUCTS_OFFER_LIMIT", "50"))
     max_dim = int(os.getenv("OFFERS_IMAGE_MAX_DIM", "1280"))
     quality = int(os.getenv("OFFERS_IMAGE_QUALITY", "70"))
     max_bytes = int(os.getenv("OFFERS_IMAGE_MAX_BYTES", "850000"))
@@ -864,62 +902,68 @@ def process_daily_product_offers(db: Session, group_ids: List[str]) -> int:
     )
 
     products = db.execute(stmt).scalars().all()
-    print(
-        f"[worker] offers: found {len(products)} products IN_STOCK "
-        f"(query_limit={limit_query}, max_per_day={max_per_day}, interval={interval_s}s, groups={len(group_ids)})"
-    )
+    print(f"[worker] offers(hourly): scanning {len(products)} IN_STOCK (query_limit={limit_query}, groups={len(group_ids)})")
 
-    sent = 0
+    chosen: Optional[ProductORM] = None
+    chosen_cover_key: Optional[str] = None
+
     for p in products:
-        if sent >= max_per_day:
-            break
-
         images = sorted(p.images or [], key=lambda x: x.position or 9999)
         if not images:
             continue
 
         cover = images[0]
+        cover_key = (getattr(cover, "url", None) or "").strip()
+        if not cover_key:
+            continue
 
-        title = (
-            "🔥 *OFERTA DO DIA 🔥*\n"
-            f"🏍️ Modelo: {p.brand} {p.model}\n"
-            f"🎨 Cor: {p.color}\n"
-            f"📆 Ano: {p.year}\n"
-            f"🛣️ Kilometragem: {p.km}\n"
-            f"💰 *Preço: {format_brl(p.sale_price)}*\n"
+        chosen = p
+        chosen_cover_key = cover_key
+        break
+
+    if not chosen or not chosen_cover_key:
+        print("[worker] offers(hourly): nenhum produto com imagem encontrado, não enviou.")
+        return 0
+
+    p = chosen
+    title = (
+        "🔥 *OFERTA DO DIA 🔥*\n"
+        f"🏍️ Modelo: {p.brand} {p.model}\n"
+        f"🎨 Cor: {p.color}\n"
+        f"📆 Ano: {p.year}\n"
+        f"🛣️ Kilometragem: {p.km}\n"
+        f"💰 *Preço: {format_brl(p.sale_price)}*\n"
+    )
+
+    try:
+        original_bytes = fetch_image_bytes_from_storage(chosen_cover_key)
+
+        body = image_bytes_to_data_uri_jpeg_optimized(
+            original_bytes,
+            max_dim=max_dim,
+            quality=quality,
+            max_bytes=max_bytes,
         )
 
-        try:
-            original_bytes = fetch_image_bytes_from_storage(cover.url)
-
-            body = image_bytes_to_data_uri_jpeg_optimized(
-                original_bytes,
-                max_dim=max_dim,
-                quality=quality,
-                max_bytes=max_bytes,
+        for group_to in group_ids:
+            send_whatsapp_group_file_datauri(
+                to_group=group_to,
+                type_="image",
+                title=title,
+                body=body,
             )
 
-            # ✅ envia o MESMO produto para TODOS os grupos
-            for group_to in group_ids:
-                send_whatsapp_group_file_datauri(
-                    to_group=group_to,
-                    type_="image",
-                    title=title,
-                    body=body,
-                )
+        print(f"[worker] offers(hourly): SENT product_id={p.id} to_groups={len(group_ids)}")
+        return 1
 
-            # conta 1 produto enviado (não 1 por grupo)
-            sent += 1
+    except (BlibsendError, requests.RequestException, Exception) as e:
+        print(f"[worker] offers(hourly): FAILED product_id={p.id}: {e}")
+        return 0
 
-            # pausa entre produtos (não entre grupos)
-            if interval_s > 0:
-                time.sleep(interval_s)
 
-        except BlibsendError as e:
-            print(f"[worker] offers: FAILED product {p.id}: {e}")
-
-    return sent
-
+# ============================================================
+# LOOP
+# ============================================================
 
 def run_loop() -> None:
     to_number = os.getenv("BLIBSEND_DEFAULT_TO", "").strip()
@@ -937,15 +981,15 @@ def run_loop() -> None:
     interval = int(os.getenv("WORKER_INTERVAL_SECONDS", "30"))
     days = int(os.getenv("PROMISSORY_REMINDER_DAYS", "5"))
 
-    offer_hour = int(os.getenv("PRODUCTS_OFFER_HOUR", "9"))
-    offer_limit = int(os.getenv("PRODUCTS_OFFER_LIMIT", "20"))
-    offer_interval = int(os.getenv("OFFERS_SEND_INTERVAL_SECONDS", "8"))
-    offer_max = int(os.getenv("OFFERS_MAX_PER_DAY", "5"))
+    # ✅ janela 07h -> 21h (1 por hora)
+    offers_start_hour = int(os.getenv("OFFERS_START_HOUR", "7"))
+    offers_end_hour = int(os.getenv("OFFERS_END_HOUR", "21"))
+    offer_limit = int(os.getenv("PRODUCTS_OFFER_LIMIT", "50"))
 
     print(
         f"[worker] started. interval={interval}s to={to_number} due_soon_days={days} "
-        f"offers_hour={offer_hour} offers_limit={offer_limit} offers_interval={offer_interval}s "
-        f"offers_max={offer_max} group_ids={group_ids}"
+        f"offers_window={offers_start_hour}-{offers_end_hour} products_limit={offer_limit} "
+        f"group_ids={group_ids}"
     )
 
     while True:
@@ -960,14 +1004,12 @@ def run_loop() -> None:
                 db.rollback()
                 print(f"[worker] ERROR process_finance: {ex}")
 
-            # ✅ continua avisando o dono X dias antes (PROMISSORY_REMINDER_DAYS, default 5)
             try:
                 c = process_installments_due_soon(db, to_number)
             except Exception as ex:
                 db.rollback()
                 print(f"[worker] ERROR process_installments_due_soon: {ex}")
 
-            # ✅ D0: manda pro cliente com Pix
             try:
                 e = process_installments_due_today_to_client(db)
             except Exception as ex:
@@ -980,26 +1022,23 @@ def run_loop() -> None:
                 db.rollback()
                 print(f"[worker] ERROR process_installments_overdue: {ex}")
 
-            # ✅ relatório semanal (com lucro estimado)
             try:
                 wr = process_weekly_report(db, to_number)
             except Exception as ex:
                 db.rollback()
                 print(f"[worker] ERROR process_weekly_report: {ex}")
 
+            # ✅ OFERTAS por hora (07h->21h)
             try:
                 now_local_dt = datetime.now()
-                sent_today = already_sent_offers_today()
-
-                if now_local_dt.hour >= offer_hour and not sent_today:
-                    d = process_daily_product_offers(db, group_ids)
-
+                if offers_can_send_now(now_local_dt, start_hour=offers_start_hour, end_hour=offers_end_hour):
+                    d = process_hourly_product_offer(db, group_ids)
                     if d > 0:
-                        mark_offers_sent_today()
-
+                        # marca somente se enviou
+                        mark_offers_sent_this_hour(now_local_dt)
             except Exception as ex:
                 db.rollback()
-                print(f"[worker] ERROR process_daily_product_offers: {ex}")
+                print(f"[worker] ERROR process_hourly_product_offer: {ex}")
 
             if a or b or c or d or e or wr:
                 print(
