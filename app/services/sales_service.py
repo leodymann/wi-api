@@ -104,8 +104,8 @@ def create_sale(
     product = db.get(ProductORM, product_id)
     if not product:
         raise ValueError("product_id inválido.")
-    if product.status != ProductStatus.IN_STOCK:
-        raise ValueError("Produto não está disponível (precisa estar IN_STOCK).")
+    if product.status not in (ProductStatus.IN_STOCK, ProductStatus.RESERVED):
+        raise ValueError("Produto não está disponível (precisa estar IN_STOCK ou RESERVED).")
 
     total = _quantize_money(Decimal(total))
     discount = _quantize_money(Decimal(discount))
