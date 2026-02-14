@@ -14,7 +14,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from dotenv import load_dotenv
 from PIL import Image
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, func
 from sqlalchemy.orm import Session, selectinload
 
 from app.infra.db import SessionLocal
@@ -25,6 +25,8 @@ from app.infra.models import (
     InstallmentStatus,
     PromissoryORM,
     SaleORM,
+    SaleStatus,          # ✅ novo (pro relatório)
+    PaymentType,         # ✅ novo (pro relatório)
     WppSendStatus,
     ProductORM,
     ProductStatus,
@@ -44,6 +46,9 @@ UPLOAD_ROOT = Path("uploads")
 STATE_DIR = Path(".worker_state")
 STATE_DIR.mkdir(exist_ok=True)
 OFFERS_SENT_FILE = STATE_DIR / "offers_sent_date.txt"
+
+# ✅ anti-duplicidade do relatório semanal
+WEEKLY_REPORT_SENT_FILE = STATE_DIR / "weekly_report_sent.txt"
 
 
 def now_utc() -> datetime:
@@ -202,6 +207,230 @@ def _commit_row(db: Session, row) -> None:
     except Exception:
         pass
 
+
+# ============================================================
+# ✅ RELATÓRIO SEMANAL (vendas/entradas/financeiro + lucro estimado)
+# ============================================================
+
+def week_start_end_local(today: date) -> tuple[date, date]:
+    """
+    Semana padrão: segunda->domingo
+    """
+    start = today - timedelta(days=today.weekday())  # monday
+    end = start + timedelta(days=6)                  # sunday
+    return start, end
+
+
+def weekly_label(start: date, end: date) -> str:
+    return f"{start.isoformat()}_{end.isoformat()}"
+
+
+def weekly_already_sent(label: str) -> bool:
+    if not WEEKLY_REPORT_SENT_FILE.exists():
+        return False
+    return WEEKLY_REPORT_SENT_FILE.read_text(encoding="utf-8").strip() == label
+
+
+def weekly_mark_sent(label: str) -> None:
+    WEEKLY_REPORT_SENT_FILE.write_text(label, encoding="utf-8")
+
+
+def process_weekly_report(db: Session, to_number: str) -> int:
+    """
+    Envia 1x por semana um resumo:
+      - Vendas confirmadas: bruto, desconto, líquido, entradas
+      - Por payment_type (líquido)
+      - Parcelas pagas na semana (recebimentos)
+      - Finance: contas criadas na semana + snapshot atual por status
+      - ✅ Lucro estimado: (total - desconto) - custo_snapshot
+         -> usa SaleORM.product_cost_price (snapshot)
+    """
+    enabled = (os.getenv("WEEKLY_REPORT_ENABLED", "1").strip().lower() in ("1", "true", "yes"))
+    if not enabled:
+        return 0
+
+    wd = int(os.getenv("WEEKLY_REPORT_WEEKDAY", "0"))      # 0=segunda ... 6=domingo
+    hour = int(os.getenv("WEEKLY_REPORT_HOUR", "8"))
+    minute = int(os.getenv("WEEKLY_REPORT_MINUTE", "0"))
+
+    now_local = datetime.now()
+    if now_local.weekday() != wd:
+        return 0
+    if (now_local.hour, now_local.minute) < (hour, minute):
+        return 0
+
+    today = today_local_date()
+    start_d, end_d = week_start_end_local(today)
+
+    label = weekly_label(start_d, end_d)
+    if weekly_already_sent(label):
+        return 0
+
+    start_dt = datetime.combine(start_d, datetime.min.time())
+    end_dt = datetime.combine(end_d + timedelta(days=1), datetime.min.time())  # exclusivo
+
+    # =========================
+    # VENDAS (sales) - confirmadas na semana
+    # =========================
+    q_sales_confirmed = (
+        select(
+            func.count(SaleORM.id),
+            func.coalesce(func.sum(SaleORM.total), 0),
+            func.coalesce(func.sum(SaleORM.discount), 0),
+            func.coalesce(func.sum(SaleORM.entry_amount), 0),
+            # ✅ lucro estimado (usa snapshot do custo na venda)
+            func.coalesce(func.sum((SaleORM.total - SaleORM.discount) - func.coalesce(SaleORM.product_cost_price, 0)), 0),
+        )
+        .where(
+            and_(
+                SaleORM.status == SaleStatus.CONFIRMED,
+                SaleORM.created_at >= start_dt,
+                SaleORM.created_at < end_dt,
+            )
+        )
+    )
+    sc, s_total, s_discount, s_entry, s_profit = db.execute(q_sales_confirmed).one()
+
+    sales_confirmed_count = int(sc or 0)
+    sales_total = Decimal(str(s_total or "0"))
+    sales_discount = Decimal(str(s_discount or "0"))
+    sales_entry = Decimal(str(s_entry or "0"))
+    sales_net = (sales_total - sales_discount).quantize(Decimal("0.01"))
+
+    profit_estimated = Decimal(str(s_profit or "0")).quantize(Decimal("0.01"))
+
+    # Por tipo de pagamento (somente confirmadas) - líquido
+    def sum_by_payment(pt: PaymentType) -> Decimal:
+        q = (
+            select(func.coalesce(func.sum(SaleORM.total - SaleORM.discount), 0))
+            .where(
+                and_(
+                    SaleORM.status == SaleStatus.CONFIRMED,
+                    SaleORM.payment_type == pt,
+                    SaleORM.created_at >= start_dt,
+                    SaleORM.created_at < end_dt,
+                )
+            )
+        )
+        v = db.execute(q).scalar()
+        return Decimal(str(v or "0"))
+
+    cash_total = sum_by_payment(PaymentType.CASH)
+    pix_total = sum_by_payment(PaymentType.PIX)
+    card_total = sum_by_payment(PaymentType.CARD)
+    prom_total = sum_by_payment(PaymentType.PROMISSORY)
+
+    # Canceladas (só pra informação)
+    q_sales_canceled = (
+        select(func.count(SaleORM.id))
+        .where(
+            and_(
+                SaleORM.status == SaleStatus.CANCELED,
+                SaleORM.created_at >= start_dt,
+                SaleORM.created_at < end_dt,
+            )
+        )
+    )
+    sales_canceled_count = int(db.execute(q_sales_canceled).scalar() or 0)
+
+    # =========================
+    # RECEBIMENTOS (parcelas pagas na semana)
+    # =========================
+    q_inst_paid = (
+        select(
+            func.count(InstallmentORM.id),
+            func.coalesce(func.sum(InstallmentORM.paid_amount), 0),
+            func.coalesce(func.sum(InstallmentORM.amount), 0),
+        )
+        .where(
+            and_(
+                InstallmentORM.status == InstallmentStatus.PAID,
+                InstallmentORM.paid_at.is_not(None),
+                InstallmentORM.paid_at >= start_dt,
+                InstallmentORM.paid_at < end_dt,
+            )
+        )
+    )
+    ic, inst_paid_amount_sum, inst_nominal_sum = db.execute(q_inst_paid).one()
+    installments_paid_count = int(ic or 0)
+    installments_paid_amount = Decimal(str(inst_paid_amount_sum or "0"))
+    installments_nominal = Decimal(str(inst_nominal_sum or "0"))
+
+    # Se paid_amount estiver NULL (caso antigo), cai pro nominal
+    received_installments = installments_paid_amount if installments_paid_amount > 0 else installments_nominal
+
+    # =========================
+    # FINANCEIRO (contas)
+    # =========================
+    q_fin_created = (
+        select(
+            func.count(FinanceORM.id),
+            func.coalesce(func.sum(FinanceORM.amount), 0),
+        )
+        .where(
+            and_(
+                FinanceORM.created_at >= start_dt,
+                FinanceORM.created_at < end_dt,
+            )
+        )
+    )
+    fc, fin_created_sum = db.execute(q_fin_created).one()
+    finance_created_count = int(fc or 0)
+    finance_created_total = Decimal(str(fin_created_sum or "0"))
+
+    # Snapshot atual (pendente/paid/canceled)
+    def fin_sum_status(st: FinanceStatus) -> Decimal:
+        q = select(func.coalesce(func.sum(FinanceORM.amount), 0)).where(FinanceORM.status == st)
+        v = db.execute(q).scalar()
+        return Decimal(str(v or "0"))
+
+    fin_pending_total = fin_sum_status(FinanceStatus.PENDING)
+    fin_paid_total = fin_sum_status(FinanceStatus.PAID)
+    fin_canceled_total = fin_sum_status(FinanceStatus.CANCELED)
+
+    # =========================
+    # Mensagem WhatsApp
+    # =========================
+    period = f"{start_d.strftime('%d/%m')} a {end_d.strftime('%d/%m')}"
+    msg = (
+        f"📊 *RELATÓRIO SEMANAL*\n"
+        f"🗓️ Período: {period}\n\n"
+        f"🏍️ *Vendas (CONFIRMADAS)*\n"
+        f"• Qtd: {sales_confirmed_count}\n"
+        f"• Bruto: {format_brl(sales_total)}\n"
+        f"• Descontos: {format_brl(sales_discount)}\n"
+        f"• Líquido (bruto-desconto): *{format_brl(sales_net)}*\n"
+        f"• Entradas: {format_brl(sales_entry)}\n"
+        f"• ✅ Lucro estimado: *{format_brl(profit_estimated)}*\n"
+        f"• Canceladas: {sales_canceled_count}\n\n"
+        f"💳 *Por pagamento (líquido)*\n"
+        f"• Dinheiro: {format_brl(cash_total)}\n"
+        f"• Pix: {format_brl(pix_total)}\n"
+        f"• Cartão: {format_brl(card_total)}\n"
+        f"• Promissória: {format_brl(prom_total)}\n\n"
+        f"✅ *Recebimentos (parcelas pagas)*\n"
+        f"• Qtd: {installments_paid_count}\n"
+        f"• Total recebido: *{format_brl(received_installments)}*\n\n"
+        f"🏦 *Financeiro*\n"
+        f"• Contas criadas na semana: {finance_created_count}\n"
+        f"• Total criado na semana: {format_brl(finance_created_total)}\n"
+        f"• Pendente (atual): {format_brl(fin_pending_total)}\n"
+        f"• Pago (atual): {format_brl(fin_paid_total)}\n"
+        f"• Cancelado (atual): {format_brl(fin_canceled_total)}\n"
+    )
+
+    try:
+        send_whatsapp_text(to=to_number, body=msg)
+        weekly_mark_sent(label)
+        return 1
+    except BlibsendError as e:
+        print(f"[worker] weekly_report FAILED: {e}")
+        return 0
+
+
+# ============================================================
+# PROCESSOS EXISTENTES
+# ============================================================
 
 def process_finance(db: Session, to_number: str) -> int:
     today = today_local_date()
@@ -363,11 +592,6 @@ def process_installments_due_soon(db: Session, to_number: str) -> int:
 def process_installments_due_today_to_client(db: Session) -> int:
     """
     ✅ NO DIA DO VENCIMENTO (D0) -> manda para o CLIENTE com PIX.
-
-    Anti-duplicidade correto:
-      - usa wa_today_* (que você já criou no banco)
-      - marca SENDING e commita ANTES de enviar
-      - filtra no SQL para não pegar SENT/SENDING e respeitar next_retry
     """
     enabled = os.getenv("DUE_TODAY_SEND_ENABLED", "1").strip() in ("1", "true", "True")
     if not enabled:
@@ -728,7 +952,7 @@ def run_loop() -> None:
         started = time.time()
 
         with SessionLocal() as db:
-            a = b = c = d = e = 0
+            a = b = c = d = e = wr = 0
 
             try:
                 a = process_finance(db, to_number)
@@ -756,6 +980,13 @@ def run_loop() -> None:
                 db.rollback()
                 print(f"[worker] ERROR process_installments_overdue: {ex}")
 
+            # ✅ relatório semanal (com lucro estimado)
+            try:
+                wr = process_weekly_report(db, to_number)
+            except Exception as ex:
+                db.rollback()
+                print(f"[worker] ERROR process_weekly_report: {ex}")
+
             try:
                 now_local_dt = datetime.now()
                 sent_today = already_sent_offers_today()
@@ -770,10 +1001,10 @@ def run_loop() -> None:
                 db.rollback()
                 print(f"[worker] ERROR process_daily_product_offers: {ex}")
 
-            if a or b or c or d or e:
+            if a or b or c or d or e or wr:
                 print(
                     f"[worker] sent finance={a} due_soon_installments={c} "
-                    f"due_today_client={e} overdue_installments={b} offers={d}"
+                    f"due_today_client={e} overdue_installments={b} offers={d} weekly_report={wr}"
                 )
 
         elapsed = time.time() - started
