@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Optional, List, Sequence
+from typing import Optional, Sequence
 
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Form, Depends
 from sqlalchemy.orm import Session
@@ -10,8 +10,8 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DBSession
 from app.api.auth_deps import get_current_user
-from app.infra.models import ProductORM, ProductStatus, ProductImageORM
-from app.schemas.products import ProductOut, ProductImageOut  # ajuste se seus schemas tiverem nomes diferentes
+from app.infra.models import ProductORM, ProductStatus, ProductImageORM, UserORM, UserRole
+from app.schemas.products import ProductOut, ProductImageOut
 
 from app.infra.storage_s3 import (
     upload_image_bytes,
@@ -35,12 +35,18 @@ def normalize_chassi(chassi: str) -> str:
     return chassi.strip().upper().replace(" ", "")
 
 
-def _product_out_with_presigned(product: ProductORM) -> ProductOut:
+def _product_out_with_presigned(product: ProductORM, *, hide_cost: bool) -> ProductOut:
     """
-    Converte ORM -> ProductOut e troca image.url (KEY) por URL presignada
-    SEM mutar o ORM.
+    Converte ORM -> ProductOut
+    - presigna imagens (key -> url)
+    - esconde cost_price se hide_cost=True
     """
-    out = ProductOut.model_validate(product, from_attributes=True)  # pydantic v2
+    out = ProductOut.model_validate(product, from_attributes=True)
+
+    if hide_cost:
+        # depende do seu schema: cost_price precisa aceitar Optional[Decimal]
+        out.cost_price = None  # type: ignore
+
     if out.images:
         fixed = []
         for img in out.images:
@@ -49,15 +55,20 @@ def _product_out_with_presigned(product: ProductORM) -> ProductOut:
                 u = presign_get_url(u, expires_seconds=3600)
             fixed.append(ProductImageOut(**{**img.model_dump(), "url": u}))
         out.images = fixed
+
     return out
 
 
-def _products_out_with_presigned(products: Sequence[ProductORM]) -> list[ProductOut]:
-    return [_product_out_with_presigned(p) for p in products]
+def _products_out_with_presigned(products: Sequence[ProductORM], *, hide_cost: bool) -> list[ProductOut]:
+    return [_product_out_with_presigned(p, hide_cost=hide_cost) for p in products]
 
 
 @router.get("/{product_id}", response_model=ProductOut)
-def get_product(product_id: int, db: Session = DBSession):
+def get_product(
+    product_id: int,
+    db: Session = DBSession,
+    me: UserORM = Depends(get_current_user),
+):
     stmt = (
         select(ProductORM)
         .options(selectinload(ProductORM.images))
@@ -66,13 +77,16 @@ def get_product(product_id: int, db: Session = DBSession):
     product = db.execute(stmt).scalars().first()
     if not product:
         raise HTTPException(status_code=404, detail="Produto não encontrado.")
-    return _product_out_with_presigned(product)
+
+    hide_cost = me.role != UserRole.ADMIN
+    return _product_out_with_presigned(product, hide_cost=hide_cost)
 
 
 @router.put("/{product_id}", response_model=ProductOut)
 async def update_product(
     product_id: int,
     db: Session = DBSession,
+    me: UserORM = Depends(get_current_user),
 
     brand: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
@@ -93,6 +107,10 @@ async def update_product(
     images: list[UploadFile] = File(default=[]),
     replace_images: bool = Form(False),
 ):
+    # ✅ STAFF não edita
+    if me.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Apenas ADMIN pode editar produto.")
+
     stmt = (
         select(ProductORM)
         .options(selectinload(ProductORM.images))
@@ -175,11 +193,10 @@ async def update_product(
                     detail=f"Tipo de arquivo não suportado: {img.content_type}. Use jpeg/png/webp.",
                 )
 
-        # IMPORTANTE: aqui product.images ainda tem KEYs, porque a gente nunca presignou no ORM
         if replace_images:
             old_images = list(product.images)
             for old in old_images:
-                delete_object_best_effort(old.url)  # old.url é KEY
+                delete_object_best_effort(old.url)
                 db.delete(old)
             db.flush()
 
@@ -199,7 +216,7 @@ async def update_product(
 
             db.add(ProductImageORM(
                 product_id=product.id,
-                url=key,        # salva KEY
+                url=key,
                 position=idx,
             ))
 
@@ -213,12 +230,14 @@ async def update_product(
         .where(ProductORM.id == product_id)
     )
     updated = db.execute(stmt2).scalars().one()
-    return _product_out_with_presigned(updated)
+
+    return _product_out_with_presigned(updated, hide_cost=False)
 
 
 @router.post("", response_model=ProductOut, status_code=201)
 async def create_product(
     db: Session = DBSession,
+    me: UserORM = Depends(get_current_user),
 
     brand: str = Form(..., min_length=2, max_length=60),
     model: str = Form(..., min_length=1, max_length=80),
@@ -238,6 +257,10 @@ async def create_product(
 
     images: list[UploadFile] = File(..., description="Envie de 2 a 4 imagens"),
 ):
+    # ✅ STAFF não cria
+    if me.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Apenas ADMIN pode criar produto.")
+
     if not (2 <= len(images) <= 4):
         raise HTTPException(status_code=422, detail="Envie entre 2 e 4 imagens.")
 
@@ -306,7 +329,7 @@ async def create_product(
 
             db.add(ProductImageORM(
                 product_id=product.id,
-                url=key,  # salva KEY
+                url=key,
                 position=idx,
             ))
 
@@ -320,7 +343,7 @@ async def create_product(
         created = db.execute(stmt).scalars().one()
 
         db.commit()
-        return _product_out_with_presigned(created)
+        return _product_out_with_presigned(created, hide_cost=False)
 
     except HTTPException:
         db.rollback()
@@ -337,6 +360,8 @@ async def create_product(
 @router.get("", response_model=list[ProductOut])
 def list_products(
     db: Session = DBSession,
+    me: UserORM = Depends(get_current_user),
+
     q: Optional[str] = Query(default=None),
     status: Optional[str] = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
@@ -369,4 +394,6 @@ def list_products(
 
     stmt = stmt.limit(limit).offset(offset)
     products = db.execute(stmt).scalars().all()
-    return _products_out_with_presigned(products)
+
+    hide_cost = me.role != UserRole.ADMIN
+    return _products_out_with_presigned(products, hide_cost=hide_cost)
