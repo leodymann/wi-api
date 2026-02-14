@@ -1,3 +1,4 @@
+# app/services/sales_service.py
 from __future__ import annotations
 
 from datetime import datetime, date
@@ -82,11 +83,15 @@ def create_sale(
     total: Decimal,
     discount: Decimal = Decimal("0.00"),
     entry_amount: Optional[Decimal] = None,
+
+    # ✅ NOVO: tipo da entrada (CASH|PIX|CARD)
+    entry_amount_type: Optional[str] = None,
+
     payment_type: PaymentType,
     installments_count: Optional[int] = None,
     first_due_date: Optional[date] = None,
 
-    # ✅ NOVOS: ajuste da promissória + regras atraso
+    # ✅ ajuste da promissória + regras atraso
     promissory_total: Optional[Decimal] = None,
     daily_late_fee: Optional[Decimal] = None,
 ) -> Tuple[SaleORM, Optional[PromissoryORM]]:
@@ -99,8 +104,8 @@ def create_sale(
     product = db.get(ProductORM, product_id)
     if not product:
         raise ValueError("product_id inválido.")
-    if product.status not in (ProductStatus.IN_STOCK, ProductStatus.RESERVED):
-        raise ValueError("Produto não está disponível (precisa estar IN_STOCK ou RESERVED).")
+    if product.status != ProductStatus.IN_STOCK:
+        raise ValueError("Produto não está disponível (precisa estar IN_STOCK).")
 
     total = _quantize_money(Decimal(total))
     discount = _quantize_money(Decimal(discount))
@@ -116,6 +121,20 @@ def create_sale(
     entry = entry_amount or Decimal("0.00")
     if entry > total:
         raise ValueError("Entrada maior que o total.")
+
+    # ============================================================
+    # ✅ NOVO: valida tipo da entrada
+    # - se entry > 0 -> exige entry_amount_type em {CASH,PIX,CARD}
+    # - se entry == 0 -> força None
+    # ============================================================
+    entry_type_norm = (entry_amount_type or "").strip().upper() or None
+    if entry > 0:
+        if not entry_type_norm:
+            raise ValueError("Informe entry_amount_type quando houver entrada (CASH/PIX/CARD).")
+        if entry_type_norm not in ("CASH", "PIX", "CARD"):
+            raise ValueError("entry_amount_type inválido. Use CASH, PIX ou CARD.")
+    else:
+        entry_type_norm = None
 
     # normaliza novos campos
     if promissory_total is not None:
@@ -139,6 +158,10 @@ def create_sale(
         total=total,
         discount=discount,
         entry_amount=entry_amount,
+
+        # ✅ NOVO
+        entry_amount_type=entry_type_norm,
+
         payment_type=payment_type,
         status=SaleStatus.DRAFT,
 
@@ -185,10 +208,11 @@ def create_sale(
             client_id=client_id,
             product_id=product_id,
 
-            total=prom_principal,              # ✅ valor ajustado vira a promissória
+            total=prom_principal,
             entry_amount=_quantize_money(entry),
 
-            daily_late_fee=daily_late_fee,
+            # ✅ se vier None, o model tem default=0, mas aqui mantém coerência
+            daily_late_fee=_quantize_money(daily_late_fee) if daily_late_fee is not None else Decimal("0.00"),
 
             status=PromissoryStatus.DRAFT,
         )
@@ -355,12 +379,9 @@ def pay_installment(
         db.flush()
 
         # ✅ marca a venda como CONFIRMED (quitada, segundo sua regra)
-        sale = prom.sale  # relationship 0..1 já existe
+        sale = prom.sale
         if sale and sale.status != SaleStatus.CANCELED:
             sale.status = SaleStatus.CONFIRMED
             db.flush()
 
     return inst
-
-
-
