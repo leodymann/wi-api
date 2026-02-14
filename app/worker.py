@@ -138,16 +138,15 @@ def phone_to_blibsend_to(phone: str) -> str:
         return ""
     if digits.startswith("55") and len(digits) >= 12:
         return digits
-    # se veio com DDD+numero (10/11)
     if len(digits) in (10, 11):
         return "55" + digits
-    return digits  # fallback
+    return digits
 
 
 def _commit_row(db: Session, row) -> None:
     """
-    Commita logo após atualizar SENT/FAILED para não perder status
-    se outra parte do loop der erro e fizer rollback.
+    Commita logo após atualizar SENT/FAILED/SENDING para não perder status
+    e evitar duplicidade em loop rápido.
     """
     db.commit()
     try:
@@ -157,10 +156,6 @@ def _commit_row(db: Session, row) -> None:
 
 
 def process_finance(db: Session, to_number: str) -> int:
-    """
-    Envia contas vencidas/pendentes para o dono.
-    Ao enviar: wpp_status = SENT + wpp_sent_at.
-    """
     today = today_local_date()
 
     stmt = (
@@ -228,7 +223,6 @@ def process_finance(db: Session, to_number: str) -> int:
 def process_installments_due_soon(db: Session, to_number: str) -> int:
     """
     Envia lembrete X dias antes do vencimento (para o dono).
-    Ao enviar: wa_due_status = SENT + wa_due_sent_at.
     """
     days = int(os.getenv("PROMISSORY_REMINDER_DAYS", "5"))
     today = today_local_date()
@@ -320,13 +314,12 @@ def process_installments_due_soon(db: Session, to_number: str) -> int:
 
 def process_installments_due_today_to_client(db: Session) -> int:
     """
-    ✅ NOVO:
-    No DIA do vencimento (D0), manda msg pro CLIENTE com chave Pix + valor.
-    Para evitar duplicidade, usa campos:
-      - wa_due_today_status / wa_due_today_sent_at / wa_due_today_tries / wa_due_today_next_retry_at / wa_due_today_last_error
+    ✅ NO DIA DO VENCIMENTO (D0) -> manda para o CLIENTE com PIX.
 
-    Se suas colunas ainda não existem, o envio funciona,
-    mas você deve criar as colunas para não reenviar em loops.
+    Anti-duplicidade correto:
+      - usa wa_today_* (que você já criou no banco)
+      - marca SENDING e commita ANTES de enviar
+      - filtra no SQL para não pegar SENT/SENDING e respeitar next_retry
     """
     enabled = os.getenv("DUE_TODAY_SEND_ENABLED", "1").strip() in ("1", "true", "True")
     if not enabled:
@@ -355,6 +348,13 @@ def process_installments_due_today_to_client(db: Session) -> int:
             and_(
                 InstallmentORM.status == InstallmentStatus.PENDING,
                 InstallmentORM.due_date == today,
+
+                InstallmentORM.wa_today_status != WppSendStatus.SENT,
+                InstallmentORM.wa_today_status != WppSendStatus.SENDING,
+                or_(
+                    InstallmentORM.wa_today_next_retry_at.is_(None),
+                    InstallmentORM.wa_today_next_retry_at <= now_utc(),
+                ),
             )
         )
         .order_by(InstallmentORM.id.asc())
@@ -363,13 +363,6 @@ def process_installments_due_today_to_client(db: Session) -> int:
 
     rows = db.execute(stmt).scalars().all()
     sent = 0
-
-    # campos do "due today" (podem ainda não existir no seu ORM)
-    STATUS = "wa_due_today_status"
-    SENT_AT = "wa_due_today_sent_at"
-    TRIES = "wa_due_today_tries"
-    LAST_ERR = "wa_due_today_last_error"
-    NEXT_RETRY = "wa_due_today_next_retry_at"
 
     for inst in rows:
         prom = inst.promissory
@@ -381,17 +374,13 @@ def process_installments_due_today_to_client(db: Session) -> int:
         if not client_to:
             continue
 
-        status = getattr(inst, STATUS, None)
-        next_retry = getattr(inst, NEXT_RETRY, None)
-
-        if not can_try(status, next_retry):
+        if not can_try(inst.wa_today_status, inst.wa_today_next_retry_at):
             continue
 
-        # marca SENDING (se campo existir)
-        if hasattr(inst, STATUS):
-            setattr(inst, STATUS, WppSendStatus.SENDING)
-            db.flush()
-            _commit_row(db, inst)
+        # ✅ trava antes (evita mandar 2x em loop rápido)
+        inst.wa_today_status = WppSendStatus.SENDING
+        db.flush()
+        _commit_row(db, inst)
 
         product = None
         if prom is not None:
@@ -403,7 +392,6 @@ def process_installments_due_today_to_client(db: Session) -> int:
         due_str = inst.due_date.strftime("%d/%m/%Y")
         client_name = (client.name or "").strip() or "Cliente"
 
-        # mensagem pro cliente (simples e direta)
         msg = (
             f"Olá, {client_name}! 👋\n"
             f"Hoje ({due_str}) vence sua parcela de {moto_label}.\n\n"
@@ -417,35 +405,24 @@ def process_installments_due_today_to_client(db: Session) -> int:
         try:
             send_whatsapp_text(to=client_to, body=msg)
 
-            # marca SENT (se campo existir)
-            if hasattr(inst, STATUS):
-                setattr(inst, STATUS, WppSendStatus.SENT)
-                if hasattr(inst, SENT_AT):
-                    setattr(inst, SENT_AT, now_utc())
-                if hasattr(inst, LAST_ERR):
-                    setattr(inst, LAST_ERR, None)
-                if hasattr(inst, NEXT_RETRY):
-                    setattr(inst, NEXT_RETRY, None)
-                db.flush()
-                _commit_row(db, inst)
-
+            inst.wa_today_status = WppSendStatus.SENT
+            inst.wa_today_sent_at = now_utc()
+            inst.wa_today_last_error = None
+            inst.wa_today_next_retry_at = None
             sent += 1
 
+            db.flush()
+            _commit_row(db, inst)
+
         except BlibsendError as e:
-            # marca FAILED com retry (se campo existir)
-            if hasattr(inst, STATUS):
-                tries = int(getattr(inst, TRIES, 0) or 0) + 1
-                if hasattr(inst, TRIES):
-                    setattr(inst, TRIES, tries)
-                setattr(inst, STATUS, WppSendStatus.FAILED)
-                if hasattr(inst, LAST_ERR):
-                    setattr(inst, LAST_ERR, str(e)[:500])
-                if hasattr(inst, NEXT_RETRY):
-                    setattr(inst, NEXT_RETRY, now_utc() + timedelta(seconds=compute_backoff_seconds(tries)))
-                db.flush()
-                _commit_row(db, inst)
-            else:
-                print(f"[worker] DUE_TODAY send FAILED (no columns to persist): {e}")
+            tries = int(inst.wa_today_tries or 0) + 1
+            inst.wa_today_tries = tries
+            inst.wa_today_status = WppSendStatus.FAILED
+            inst.wa_today_last_error = str(e)[:500]
+            inst.wa_today_next_retry_at = now_utc() + timedelta(seconds=compute_backoff_seconds(tries))
+
+            db.flush()
+            _commit_row(db, inst)
 
     return sent
 
@@ -453,7 +430,6 @@ def process_installments_due_today_to_client(db: Session) -> int:
 def process_installments_overdue(db: Session, to_number: str) -> int:
     """
     Envia alerta de parcela atrasada (para o dono).
-    Ao enviar: wa_overdue_status = SENT + wa_overdue_sent_at.
     """
     today = today_local_date()
 
@@ -579,12 +555,9 @@ def fetch_image_bytes_from_storage(image_url_or_key: str, *, timeout: int = 30) 
         raise BlibsendError("Imagem sem url/key.")
 
     if u.startswith("http://") or u.startswith("https://"):
-        try:
-            r = requests.get(u, timeout=timeout)
-            r.raise_for_status()
-            return r.content
-        except Exception as e:
-            raise BlibsendError(f"Falha ao baixar imagem por URL: {e}")
+        r = requests.get(u, timeout=timeout)
+        r.raise_for_status()
+        return r.content
 
     if u.startswith("/static/"):
         rel = u.replace("/static/", "").lstrip("/")
@@ -593,13 +566,10 @@ def fetch_image_bytes_from_storage(image_url_or_key: str, *, timeout: int = 30) 
             raise BlibsendError(f"Arquivo local não encontrado: {file_path}")
         return file_path.read_bytes()
 
-    try:
-        url = presign_get_url(u, expires_seconds=3600)
-        r = requests.get(url, timeout=timeout)
-        r.raise_for_status()
-        return r.content
-    except Exception as e:
-        raise BlibsendError(f"Falha ao baixar do S3 (key={u}): {e}")
+    url = presign_get_url(u, expires_seconds=3600)
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r.content
 
 
 def process_daily_product_offers(db: Session, group_to: str) -> int:
@@ -628,12 +598,10 @@ def process_daily_product_offers(db: Session, group_to: str) -> int:
     sent = 0
     for p in products:
         if sent >= max_per_day:
-            print(f"[worker] offers: reached max_per_day={max_per_day}, stopping")
             break
 
         images = sorted(p.images or [], key=lambda x: x.position or 9999)
         if not images:
-            print(f"[worker] offers: product {p.id} has no images, skipping")
             continue
 
         cover = images[0]
@@ -648,7 +616,6 @@ def process_daily_product_offers(db: Session, group_to: str) -> int:
         )
 
         try:
-            print(f"[worker] offers: downloading image for product {p.id} (url/key={cover.url})")
             original_bytes = fetch_image_bytes_from_storage(cover.url)
 
             body = image_bytes_to_data_uri_jpeg_optimized(
@@ -658,7 +625,6 @@ def process_daily_product_offers(db: Session, group_to: str) -> int:
                 max_bytes=max_bytes,
             )
 
-            print(f"[worker] offers: sending product {p.id} to group={group_to}")
             send_whatsapp_group_file_datauri(
                 to_group=group_to,
                 type_="image",
@@ -666,7 +632,6 @@ def process_daily_product_offers(db: Session, group_to: str) -> int:
                 body=body,
             )
             sent += 1
-            print(f"[worker] offers: sent={sent}/{max_per_day}")
 
             if interval_s > 0:
                 time.sleep(interval_s)
@@ -674,7 +639,6 @@ def process_daily_product_offers(db: Session, group_to: str) -> int:
         except BlibsendError as e:
             print(f"[worker] offers: FAILED product {p.id}: {e}")
 
-    print(f"[worker] offers: sent total={sent}")
     return sent
 
 
@@ -719,7 +683,6 @@ def run_loop() -> None:
                 db.rollback()
                 print(f"[worker] ERROR process_installments_due_soon: {ex}")
 
-            # ✅ NOVO: vencimento hoje -> cliente + pix
             try:
                 e = process_installments_due_today_to_client(db)
             except Exception as ex:
@@ -735,24 +698,22 @@ def run_loop() -> None:
             try:
                 now_local_dt = datetime.now()
                 sent_today = already_sent_offers_today()
-                print(f"[worker] offers check: now={now_local_dt} offer_hour={offer_hour} sent_today={sent_today}")
 
                 if now_local_dt.hour >= offer_hour and not sent_today:
-                    print("[worker] offers: starting...")
                     d = process_daily_product_offers(db, group_to)
 
                     if d > 0:
                         mark_offers_sent_today()
-                        print("[worker] offers: locked day (sent_today=True)")
-                    else:
-                        print("[worker] offers: nothing sent, NOT locking the day")
 
             except Exception as ex:
                 db.rollback()
                 print(f"[worker] ERROR process_daily_product_offers: {ex}")
 
             if a or b or c or d or e:
-                print(f"[worker] sent finance={a} due_soon_installments={c} due_today_client={e} overdue_installments={b} offers={d}")
+                print(
+                    f"[worker] sent finance={a} due_soon_installments={c} "
+                    f"due_today_client={e} overdue_installments={b} offers={d}"
+                )
 
         elapsed = time.time() - started
         sleep_for = max(1, interval - int(elapsed))
