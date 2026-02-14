@@ -1,6 +1,7 @@
 # app/worker.py
 from __future__ import annotations
 
+import json
 import os
 import time
 import io
@@ -8,7 +9,7 @@ import base64
 import requests
 from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 from decimal import Decimal, ROUND_HALF_UP
 
 from dotenv import load_dotenv
@@ -141,6 +142,53 @@ def phone_to_blibsend_to(phone: str) -> str:
     if len(digits) in (10, 11):
         return "55" + digits
     return digits
+
+
+def parse_group_ids(env_value: str) -> List[str]:
+    """
+    Aceita:
+      - "id1@g.us,id2@g.us"
+      - '["id1@g.us","id2@g.us"]'
+      - "id1@g.us" (um só)
+    Retorna lista limpa e sem duplicados.
+    """
+    raw = (env_value or "").strip()
+    if not raw:
+        return []
+
+    groups: List[str] = []
+
+    # JSON array
+    if raw.startswith("["):
+        try:
+            arr = json.loads(raw)
+            if isinstance(arr, list):
+                groups = [str(x).strip() for x in arr]
+        except Exception:
+            groups = []
+
+    # vírgula ou único
+    if not groups:
+        if "," in raw:
+            groups = [x.strip() for x in raw.split(",")]
+        else:
+            groups = [raw]
+
+    # limpa, valida e remove duplicados mantendo ordem
+    seen = set()
+    out: List[str] = []
+    for g in groups:
+        if not g:
+            continue
+        if not g.endswith("@g.us"):
+            print(f"[worker] WARN: group id inválido (ignorado): {g}")
+            continue
+        if g in seen:
+            continue
+        seen.add(g)
+        out.append(g)
+
+    return out
 
 
 def _commit_row(db: Session, row) -> None:
@@ -348,7 +396,6 @@ def process_installments_due_today_to_client(db: Session) -> int:
             and_(
                 InstallmentORM.status == InstallmentStatus.PENDING,
                 InstallmentORM.due_date == today,
-
                 InstallmentORM.wa_today_status != WppSendStatus.SENT,
                 InstallmentORM.wa_today_status != WppSendStatus.SENDING,
                 or_(
@@ -377,7 +424,6 @@ def process_installments_due_today_to_client(db: Session) -> int:
         if not can_try(inst.wa_today_status, inst.wa_today_next_retry_at):
             continue
 
-        # ✅ trava antes (evita mandar 2x em loop rápido)
         inst.wa_today_status = WppSendStatus.SENDING
         db.flush()
         _commit_row(db, inst)
@@ -572,7 +618,11 @@ def fetch_image_bytes_from_storage(image_url_or_key: str, *, timeout: int = 30) 
     return r.content
 
 
-def process_daily_product_offers(db: Session, group_to: str) -> int:
+def process_daily_product_offers(db: Session, group_ids: List[str]) -> int:
+    if not group_ids:
+        print("[worker] offers: nenhum grupo configurado, pulando.")
+        return 0
+
     limit_query = int(os.getenv("PRODUCTS_OFFER_LIMIT", "20"))
     max_per_day = int(os.getenv("OFFERS_MAX_PER_DAY", "5"))
     interval_s = int(os.getenv("OFFERS_SEND_INTERVAL_SECONDS", "8"))
@@ -592,7 +642,7 @@ def process_daily_product_offers(db: Session, group_to: str) -> int:
     products = db.execute(stmt).scalars().all()
     print(
         f"[worker] offers: found {len(products)} products IN_STOCK "
-        f"(query_limit={limit_query}, max_per_day={max_per_day}, interval={interval_s}s)"
+        f"(query_limit={limit_query}, max_per_day={max_per_day}, interval={interval_s}s, groups={len(group_ids)})"
     )
 
     sent = 0
@@ -625,14 +675,19 @@ def process_daily_product_offers(db: Session, group_to: str) -> int:
                 max_bytes=max_bytes,
             )
 
-            send_whatsapp_group_file_datauri(
-                to_group=group_to,
-                type_="image",
-                title=title,
-                body=body,
-            )
+            # ✅ envia o MESMO produto para TODOS os grupos
+            for group_to in group_ids:
+                send_whatsapp_group_file_datauri(
+                    to_group=group_to,
+                    type_="image",
+                    title=title,
+                    body=body,
+                )
+
+            # conta 1 produto enviado (não 1 por grupo)
             sent += 1
 
+            # pausa entre produtos (não entre grupos)
             if interval_s > 0:
                 time.sleep(interval_s)
 
@@ -647,9 +702,13 @@ def run_loop() -> None:
     if not to_number:
         raise RuntimeError("Configure BLIBSEND_DEFAULT_TO no .env (numero destino do dono).")
 
-    group_to = os.getenv("BLIBSEND_PRODUCTS_GROUP_TO", "").strip()
-    if not group_to:
-        raise RuntimeError("Configure BLIBSEND_PRODUCTS_GROUP_TO no .env (grupo destino).")
+    group_to_raw = os.getenv("BLIBSEND_PRODUCTS_GROUP_TO", "").strip()
+    group_ids = parse_group_ids(group_to_raw)
+    if not group_ids:
+        raise RuntimeError(
+            "Configure BLIBSEND_PRODUCTS_GROUP_TO no .env. "
+            "Ex: 1203...@g.us,1203...@g.us ou JSON [\"...\"]"
+        )
 
     interval = int(os.getenv("WORKER_INTERVAL_SECONDS", "30"))
     days = int(os.getenv("PROMISSORY_REMINDER_DAYS", "5"))
@@ -662,7 +721,7 @@ def run_loop() -> None:
     print(
         f"[worker] started. interval={interval}s to={to_number} due_soon_days={days} "
         f"offers_hour={offer_hour} offers_limit={offer_limit} offers_interval={offer_interval}s "
-        f"offers_max={offer_max} group_to={group_to}"
+        f"offers_max={offer_max} group_ids={group_ids}"
     )
 
     while True:
@@ -677,12 +736,14 @@ def run_loop() -> None:
                 db.rollback()
                 print(f"[worker] ERROR process_finance: {ex}")
 
+            # ✅ continua avisando o dono X dias antes (PROMISSORY_REMINDER_DAYS, default 5)
             try:
                 c = process_installments_due_soon(db, to_number)
             except Exception as ex:
                 db.rollback()
                 print(f"[worker] ERROR process_installments_due_soon: {ex}")
 
+            # ✅ D0: manda pro cliente com Pix
             try:
                 e = process_installments_due_today_to_client(db)
             except Exception as ex:
@@ -700,7 +761,7 @@ def run_loop() -> None:
                 sent_today = already_sent_offers_today()
 
                 if now_local_dt.hour >= offer_hour and not sent_today:
-                    d = process_daily_product_offers(db, group_to)
+                    d = process_daily_product_offers(db, group_ids)
 
                     if d > 0:
                         mark_offers_sent_today()
