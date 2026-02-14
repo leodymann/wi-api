@@ -15,19 +15,18 @@ class SaleCreate(BaseModel):
 
     total: Decimal = Field(gt=0)
     discount: Decimal = Field(default=Decimal("0.00"), ge=0)
+
     entry_amount: Optional[Decimal] = Field(default=None, ge=0)
+
+    # ✅ NOVO: tipo da entrada (CASH|PIX|CARD)
+    entry_amount_type: Optional[str] = None
 
     payment_type: str  # CASH, PIX, CARD, PROMISSORY
     installments_count: Optional[int] = Field(default=None, ge=1, le=60)
     first_due_date: Optional[date] = None
 
-    # ✅ NOVO: valor ajustado do principal da promissória
-    # Ex: total=20000, entrada=10000, restante=10000, mas você quer promissória=15000 ou 20000
     promissory_total: Optional[Decimal] = Field(default=None, ge=0)
-
-    # ✅ NOVO: regras de atraso (opcionais)
-    daily_late_fee: Optional[Decimal] = Field(default=None, ge=0)         # R$/dia
-
+    daily_late_fee: Optional[Decimal] = Field(default=None, ge=0)
 
 
 class SaleOut(BaseModel):
@@ -41,6 +40,9 @@ class SaleOut(BaseModel):
     total: Decimal
     discount: Decimal
     entry_amount: Optional[Decimal]
+
+    # ✅ NOVO
+    entry_amount_type: Optional[str] = None
 
     client_id: int
     product_id: int
