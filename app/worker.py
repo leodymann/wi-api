@@ -283,6 +283,7 @@ def weekly_mark_sent(label: str) -> None:
     WEEKLY_REPORT_SENT_FILE.write_text(label, encoding="utf-8")
 
 
+# ✅ Substitua o seu process_weekly_report por este (inclui FINANCING)
 def process_weekly_report(db: Session, to_number: str) -> int:
     """
     Envia 1x por semana um resumo.
@@ -311,6 +312,9 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     start_dt = datetime.combine(start_d, datetime.min.time())
     end_dt = datetime.combine(end_d + timedelta(days=1), datetime.min.time())  # exclusivo
 
+    # -------------------------
+    # VENDAS CONFIRMADAS
+    # -------------------------
     q_sales_confirmed = (
         select(
             func.count(SaleORM.id),
@@ -358,6 +362,7 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     pix_total = sum_by_payment(PaymentType.PIX)
     card_total = sum_by_payment(PaymentType.CARD)
     prom_total = sum_by_payment(PaymentType.PROMISSORY)
+    financing_total = sum_by_payment(PaymentType.FINANCING)  # ✅ NOVO
 
     q_sales_canceled = (
         select(func.count(SaleORM.id))
@@ -371,6 +376,9 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     )
     sales_canceled_count = int(db.execute(q_sales_canceled).scalar() or 0)
 
+    # -------------------------
+    # RECEBIMENTOS (PARCELAS PAGAS)
+    # -------------------------
     q_inst_paid = (
         select(
             func.count(InstallmentORM.id),
@@ -392,6 +400,9 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     installments_nominal = Decimal(str(inst_nominal_sum or "0"))
     received_installments = installments_paid_amount if installments_paid_amount > 0 else installments_nominal
 
+    # -------------------------
+    # FINANCEIRO (CRIADO NA SEMANA)
+    # -------------------------
     q_fin_created = (
         select(
             func.count(FinanceORM.id),
@@ -408,6 +419,7 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     finance_created_count = int(fc or 0)
     finance_created_total = Decimal(str(fin_created_sum or "0"))
 
+    # ✅ Por status (atual)
     def fin_sum_status(st: FinanceStatus) -> Decimal:
         q = select(func.coalesce(func.sum(FinanceORM.amount), 0)).where(FinanceORM.status == st)
         v = db.execute(q).scalar()
@@ -417,7 +429,45 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     fin_paid_total = fin_sum_status(FinanceStatus.PAID)
     fin_canceled_total = fin_sum_status(FinanceStatus.CANCELED)
 
+    # ✅ NOVO: Por tipo de pagamento do FINANCEIRO (se FinanceORM tiver payment_type)
+    has_fin_payment_type = hasattr(FinanceORM, "payment_type")
+
+    fin_cash_week = fin_pix_week = fin_card_week = fin_prom_week = fin_financing_week = Decimal("0")
+
+    if has_fin_payment_type:
+        def fin_week_sum_by_payment(pt: PaymentType) -> Decimal:
+            q = (
+                select(func.coalesce(func.sum(FinanceORM.amount), 0))
+                .where(
+                    and_(
+                        FinanceORM.created_at >= start_dt,
+                        FinanceORM.created_at < end_dt,
+                        FinanceORM.payment_type == pt,
+                    )
+                )
+            )
+            v = db.execute(q).scalar()
+            return Decimal(str(v or "0"))
+
+        fin_cash_week = fin_week_sum_by_payment(PaymentType.CASH)
+        fin_pix_week = fin_week_sum_by_payment(PaymentType.PIX)
+        fin_card_week = fin_week_sum_by_payment(PaymentType.CARD)
+        fin_prom_week = fin_week_sum_by_payment(PaymentType.PROMISSORY)
+        fin_financing_week = fin_week_sum_by_payment(PaymentType.FINANCING)  # ✅ NOVO
+
     period = f"{start_d.strftime('%d/%m')} a {end_d.strftime('%d/%m')}"
+
+    finance_payment_block = ""
+    if has_fin_payment_type:
+        finance_payment_block = (
+            "• Por pagamento (criado na semana):\n"
+            f"   - Dinheiro: {format_brl(fin_cash_week)}\n"
+            f"   - Pix: {format_brl(fin_pix_week)}\n"
+            f"   - Cartão: {format_brl(fin_card_week)}\n"
+            f"   - Promissória: {format_brl(fin_prom_week)}\n"
+            f"   - Financiamento: {format_brl(fin_financing_week)}\n"
+        )
+
     msg = (
         f"📊 *RELATÓRIO SEMANAL*\n"
         f"🗓️ Período: {period}\n\n"
@@ -429,17 +479,19 @@ def process_weekly_report(db: Session, to_number: str) -> int:
         f"• Entradas: {format_brl(sales_entry)}\n"
         f"• ✅ Lucro estimado: *{format_brl(profit_estimated)}*\n"
         f"• Canceladas: {sales_canceled_count}\n\n"
-        f"💳 *Por pagamento (líquido)*\n"
+        f"💳 *Por pagamento (vendas - líquido)*\n"
         f"• Dinheiro: {format_brl(cash_total)}\n"
         f"• Pix: {format_brl(pix_total)}\n"
         f"• Cartão: {format_brl(card_total)}\n"
-        f"• Promissória: {format_brl(prom_total)}\n\n"
+        f"• Promissória: {format_brl(prom_total)}\n"
+        f"• Financiamento: {format_brl(financing_total)}\n\n"
         f"✅ *Recebimentos (parcelas pagas)*\n"
         f"• Qtd: {installments_paid_count}\n"
         f"• Total recebido: *{format_brl(received_installments)}*\n\n"
         f"🏦 *Financeiro*\n"
         f"• Contas criadas na semana: {finance_created_count}\n"
         f"• Total criado na semana: {format_brl(finance_created_total)}\n"
+        f"{finance_payment_block}"
         f"• Pendente (atual): {format_brl(fin_pending_total)}\n"
         f"• Pago (atual): {format_brl(fin_paid_total)}\n"
         f"• Cancelado (atual): {format_brl(fin_canceled_total)}\n"
@@ -1056,3 +1108,4 @@ if __name__ == "__main__":
         run_loop()
     except KeyboardInterrupt:
         print("[worker] stopped (Ctrl+C)")
+
