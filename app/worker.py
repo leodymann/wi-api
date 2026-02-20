@@ -4,8 +4,6 @@ from __future__ import annotations
 import json
 import os
 import time
-import io
-import base64
 import requests
 from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
@@ -13,7 +11,6 @@ from typing import Optional, List
 from decimal import Decimal, ROUND_HALF_UP
 
 from dotenv import load_dotenv
-from PIL import Image
 from sqlalchemy import and_, or_, select, func
 from sqlalchemy.orm import Session, selectinload
 
@@ -31,10 +28,12 @@ from app.infra.models import (
     ProductORM,
     ProductStatus,
 )
-from app.integrations.blibsend import (
-    BlibsendError,
+
+# ✅ UAZAPI (novo)
+from app.integrations.uazapi import (
+    UazapiError,
     send_whatsapp_text,
-    send_whatsapp_group_file_datauri,
+    send_whatsapp_media,
 )
 
 from app.infra.storage_s3 import presign_get_url
@@ -46,10 +45,7 @@ UPLOAD_ROOT = Path("uploads")
 STATE_DIR = Path(".worker_state")
 STATE_DIR.mkdir(exist_ok=True)
 
-# ✅ state do envio por hora (1/h entre 07 e 21)
 OFFERS_HOURLY_STATE_FILE = STATE_DIR / "offers_hourly_state.json"
-
-# ✅ anti-duplicidade do relatório semanal
 WEEKLY_REPORT_SENT_FILE = STATE_DIR / "weekly_report_sent.txt"
 
 
@@ -58,7 +54,6 @@ def now_utc() -> datetime:
 
 
 def today_local_date() -> date:
-    # se seu servidor estiver em UTC e você quiser Fortaleza, ajuste aqui
     return datetime.now().date()
 
 
@@ -83,10 +78,6 @@ def _save_offers_hourly_state(state: dict) -> None:
 
 
 def offers_can_send_now(now_local: datetime, *, start_hour: int, end_hour: int) -> bool:
-    """
-    Permite enviar no máximo 1 oferta por hora dentro da janela [start_hour, end_hour].
-    Reseta automaticamente quando vira o dia.
-    """
     if now_local.hour < start_hour or now_local.hour > end_hour:
         return False
 
@@ -94,10 +85,8 @@ def offers_can_send_now(now_local: datetime, *, start_hour: int, end_hour: int) 
     today = now_local.date().isoformat()
 
     if state.get("date") != today:
-        # virou o dia, pode enviar
         return True
 
-    # já enviou nesta hora?
     if state.get("last_hour_sent") == now_local.hour:
         return False
 
@@ -132,7 +121,6 @@ def compute_backoff_seconds(tries: int) -> int:
 
 
 def can_try(status: Optional[WppSendStatus], next_retry_at: Optional[datetime]) -> bool:
-    # se já foi enviado ou está enviando, não tenta
     if status in (WppSendStatus.SENT, WppSendStatus.SENDING):
         return False
     if next_retry_at is None:
@@ -182,10 +170,9 @@ def format_br_phone(phone: str) -> str:
     return phone or "-"
 
 
-def phone_to_blibsend_to(phone: str) -> str:
+def phone_to_uazapi_number(phone: str) -> str:
     """
-    Converte telefone salvo no banco para formato esperado no envio.
-    Retorna algo tipo: 55DDDNXXXXXXXX ou 55DDDNXXXXXXX
+    Uazapi aceita telefone em dígitos (ex: 5583987157461).
     """
     digits = "".join(ch for ch in (phone or "") if ch.isdigit())
     if not digits:
@@ -198,20 +185,12 @@ def phone_to_blibsend_to(phone: str) -> str:
 
 
 def parse_group_ids(env_value: str) -> List[str]:
-    """
-    Aceita:
-      - "id1@g.us,id2@g.us"
-      - '["id1@g.us","id2@g.us"]'
-      - "id1@g.us" (um só)
-    Retorna lista limpa e sem duplicados.
-    """
     raw = (env_value or "").strip()
     if not raw:
         return []
 
     groups: List[str] = []
 
-    # JSON array
     if raw.startswith("["):
         try:
             arr = json.loads(raw)
@@ -220,14 +199,12 @@ def parse_group_ids(env_value: str) -> List[str]:
         except Exception:
             groups = []
 
-    # vírgula ou único
     if not groups:
         if "," in raw:
             groups = [x.strip() for x in raw.split(",")]
         else:
             groups = [raw]
 
-    # limpa, valida e remove duplicados mantendo ordem
     seen = set()
     out: List[str] = []
     for g in groups:
@@ -245,10 +222,6 @@ def parse_group_ids(env_value: str) -> List[str]:
 
 
 def _commit_row(db: Session, row) -> None:
-    """
-    Commita logo após atualizar SENT/FAILED/SENDING para não perder status
-    e evitar duplicidade em loop rápido.
-    """
     db.commit()
     try:
         db.refresh(row)
@@ -257,15 +230,12 @@ def _commit_row(db: Session, row) -> None:
 
 
 # ============================================================
-# ✅ RELATÓRIO SEMANAL (vendas/entradas/financeiro + lucro estimado)
+# ✅ RELATÓRIO SEMANAL
 # ============================================================
 
 def week_start_end_local(today: date) -> tuple[date, date]:
-    """
-    Semana padrão: segunda->domingo
-    """
-    start = today - timedelta(days=today.weekday())  # monday
-    end = start + timedelta(days=6)                  # sunday
+    start = today - timedelta(days=today.weekday())
+    end = start + timedelta(days=6)
     return start, end
 
 
@@ -283,16 +253,12 @@ def weekly_mark_sent(label: str) -> None:
     WEEKLY_REPORT_SENT_FILE.write_text(label, encoding="utf-8")
 
 
-# ✅ Substitua o seu process_weekly_report por este (inclui FINANCING)
 def process_weekly_report(db: Session, to_number: str) -> int:
-    """
-    Envia 1x por semana um resumo.
-    """
     enabled = (os.getenv("WEEKLY_REPORT_ENABLED", "1").strip().lower() in ("1", "true", "yes"))
     if not enabled:
         return 0
 
-    wd = int(os.getenv("WEEKLY_REPORT_WEEKDAY", "0"))      # 0=segunda ... 6=domingo
+    wd = int(os.getenv("WEEKLY_REPORT_WEEKDAY", "0"))
     hour = int(os.getenv("WEEKLY_REPORT_HOUR", "8"))
     minute = int(os.getenv("WEEKLY_REPORT_MINUTE", "0"))
 
@@ -310,11 +276,8 @@ def process_weekly_report(db: Session, to_number: str) -> int:
         return 0
 
     start_dt = datetime.combine(start_d, datetime.min.time())
-    end_dt = datetime.combine(end_d + timedelta(days=1), datetime.min.time())  # exclusivo
+    end_dt = datetime.combine(end_d + timedelta(days=1), datetime.min.time())
 
-    # -------------------------
-    # VENDAS CONFIRMADAS
-    # -------------------------
     q_sales_confirmed = (
         select(
             func.count(SaleORM.id),
@@ -362,7 +325,7 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     pix_total = sum_by_payment(PaymentType.PIX)
     card_total = sum_by_payment(PaymentType.CARD)
     prom_total = sum_by_payment(PaymentType.PROMISSORY)
-    financing_total = sum_by_payment(PaymentType.FINANCING)  # ✅ NOVO
+    financing_total = sum_by_payment(PaymentType.FINANCING)
 
     q_sales_canceled = (
         select(func.count(SaleORM.id))
@@ -376,9 +339,6 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     )
     sales_canceled_count = int(db.execute(q_sales_canceled).scalar() or 0)
 
-    # -------------------------
-    # RECEBIMENTOS (PARCELAS PAGAS)
-    # -------------------------
     q_inst_paid = (
         select(
             func.count(InstallmentORM.id),
@@ -400,9 +360,6 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     installments_nominal = Decimal(str(inst_nominal_sum or "0"))
     received_installments = installments_paid_amount if installments_paid_amount > 0 else installments_nominal
 
-    # -------------------------
-    # FINANCEIRO (CRIADO NA SEMANA)
-    # -------------------------
     q_fin_created = (
         select(
             func.count(FinanceORM.id),
@@ -419,7 +376,6 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     finance_created_count = int(fc or 0)
     finance_created_total = Decimal(str(fin_created_sum or "0"))
 
-    # ✅ Por status (atual)
     def fin_sum_status(st: FinanceStatus) -> Decimal:
         q = select(func.coalesce(func.sum(FinanceORM.amount), 0)).where(FinanceORM.status == st)
         v = db.execute(q).scalar()
@@ -429,7 +385,6 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     fin_paid_total = fin_sum_status(FinanceStatus.PAID)
     fin_canceled_total = fin_sum_status(FinanceStatus.CANCELED)
 
-    # ✅ NOVO: Por tipo de pagamento do FINANCEIRO (se FinanceORM tiver payment_type)
     has_fin_payment_type = hasattr(FinanceORM, "payment_type")
 
     fin_cash_week = fin_pix_week = fin_card_week = fin_prom_week = fin_financing_week = Decimal("0")
@@ -453,7 +408,7 @@ def process_weekly_report(db: Session, to_number: str) -> int:
         fin_pix_week = fin_week_sum_by_payment(PaymentType.PIX)
         fin_card_week = fin_week_sum_by_payment(PaymentType.CARD)
         fin_prom_week = fin_week_sum_by_payment(PaymentType.PROMISSORY)
-        fin_financing_week = fin_week_sum_by_payment(PaymentType.FINANCING)  # ✅ NOVO
+        fin_financing_week = fin_week_sum_by_payment(PaymentType.FINANCING)
 
     period = f"{start_d.strftime('%d/%m')} a {end_d.strftime('%d/%m')}"
 
@@ -501,7 +456,7 @@ def process_weekly_report(db: Session, to_number: str) -> int:
         send_whatsapp_text(to=to_number, body=msg)
         weekly_mark_sent(label)
         return 1
-    except BlibsendError as e:
+    except UazapiError as e:
         print(f"[worker] weekly_report FAILED: {e}")
         return 0
 
@@ -560,7 +515,7 @@ def process_finance(db: Session, to_number: str) -> int:
             db.flush()
             _commit_row(db, f)
 
-        except BlibsendError as e:
+        except UazapiError as e:
             mark_failed_generic(
                 row=f,
                 tries_field="wpp_tries",
@@ -576,9 +531,6 @@ def process_finance(db: Session, to_number: str) -> int:
 
 
 def process_installments_due_soon(db: Session, to_number: str) -> int:
-    """
-    Envia lembrete X dias antes do vencimento (para o dono).
-    """
     days = int(os.getenv("PROMISSORY_REMINDER_DAYS", "5"))
     today = today_local_date()
     target = today + timedelta(days=days)
@@ -654,7 +606,7 @@ def process_installments_due_soon(db: Session, to_number: str) -> int:
             db.flush()
             _commit_row(db, inst)
 
-        except BlibsendError as e:
+        except UazapiError as e:
             tries = int(inst.wa_due_tries or 0) + 1
             inst.wa_due_tries = tries
             inst.wa_due_status = WppSendStatus.FAILED
@@ -668,9 +620,6 @@ def process_installments_due_soon(db: Session, to_number: str) -> int:
 
 
 def process_installments_due_today_to_client(db: Session) -> int:
-    """
-    ✅ NO DIA DO VENCIMENTO (D0) -> manda para o CLIENTE com PIX.
-    """
     enabled = os.getenv("DUE_TODAY_SEND_ENABLED", "1").strip() in ("1", "true", "True")
     if not enabled:
         return 0
@@ -719,7 +668,7 @@ def process_installments_due_today_to_client(db: Session) -> int:
         if not client:
             continue
 
-        client_to = phone_to_blibsend_to(client.phone or "")
+        client_to = phone_to_uazapi_number(client.phone or "")
         if not client_to:
             continue
 
@@ -762,7 +711,7 @@ def process_installments_due_today_to_client(db: Session) -> int:
             db.flush()
             _commit_row(db, inst)
 
-        except BlibsendError as e:
+        except UazapiError as e:
             tries = int(inst.wa_today_tries or 0) + 1
             inst.wa_today_tries = tries
             inst.wa_today_status = WppSendStatus.FAILED
@@ -776,9 +725,6 @@ def process_installments_due_today_to_client(db: Session) -> int:
 
 
 def process_installments_overdue(db: Session, to_number: str) -> int:
-    """
-    Envia alerta de parcela atrasada (para o dono).
-    """
     today = today_local_date()
 
     stmt = (
@@ -850,7 +796,7 @@ def process_installments_overdue(db: Session, to_number: str) -> int:
             db.flush()
             _commit_row(db, inst)
 
-        except BlibsendError as e:
+        except UazapiError as e:
             tries = int(inst.wa_overdue_tries or 0) + 1
             inst.wa_overdue_tries = tries
             inst.wa_overdue_status = WppSendStatus.FAILED
@@ -864,86 +810,38 @@ def process_installments_overdue(db: Session, to_number: str) -> int:
 
 
 # ============================================================
-# IMAGENS (S3/local/url) -> data URI otimizada
+# ✅ OFERTAS: texto + imagem via URL (Uazapi /send/media)
 # ============================================================
 
-def image_bytes_to_data_uri_jpeg_optimized(
-    data: bytes,
-    *,
-    max_dim: int,
-    quality: int,
-    max_bytes: int,
-) -> str:
-    if not data:
-        raise BlibsendError("Imagem vazia (bytes).")
-
-    try:
-        with Image.open(io.BytesIO(data)) as img:
-            img = img.convert("RGB")
-
-            w, h = img.size
-            scale = min(1.0, max_dim / float(max(w, h)))
-            if scale < 1.0:
-                img = img.resize((int(w * scale), int(h * scale)))
-
-            q = int(quality)
-            while True:
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=q, optimize=True)
-                raw = buf.getvalue()
-
-                if len(raw) <= max_bytes or q <= 35:
-                    b64 = base64.b64encode(raw).decode("utf-8")
-                    return f"data:image/jpeg;base64,{b64}"
-
-                q -= 10
-    except Exception as e:
-        raise BlibsendError(f"Falha ao processar imagem (PIL): {e}")
-
-
-def fetch_image_bytes_from_storage(image_url_or_key: str, *, timeout: int = 30) -> bytes:
+def resolve_image_to_public_url(image_url_or_key: str) -> str:
+    """
+    Uazapi precisa de URL em 'file'. Então:
+      - se já for http(s), usa direto
+      - se for key do S3, gera presigned
+      - se for /static/, não dá URL pública aqui (seu worker não é servidor).
+        (você pode trocar isso depois por uma URL pública real)
+    """
     u = (image_url_or_key or "").strip()
     if not u:
-        raise BlibsendError("Imagem sem url/key.")
+        raise UazapiError("Imagem sem url/key.")
 
     if u.startswith("http://") or u.startswith("https://"):
-        r = requests.get(u, timeout=timeout)
-        r.raise_for_status()
-        return r.content
+        return u
 
     if u.startswith("/static/"):
-        rel = u.replace("/static/", "").lstrip("/")
-        file_path = UPLOAD_ROOT / rel
-        if not file_path.exists():
-            raise BlibsendError(f"Arquivo local não encontrado: {file_path}")
-        return file_path.read_bytes()
+        # aqui você teria que ter um domínio público apontando pro seu /static
+        raise UazapiError("Imagem local /static não tem URL pública para Uazapi. Use S3 (key) ou URL http(s).")
 
-    url = presign_get_url(u, expires_seconds=3600)
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    return r.content
+    # assume S3 key
+    return presign_get_url(u, expires_seconds=3600)
 
-
-# ============================================================
-# ✅ OFERTAS: 1 por hora (07h->21h), só se tiver imagem
-# ============================================================
 
 def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
-    """
-    Envia APENAS 1 produto por chamada:
-      - somente IN_STOCK
-      - somente se tiver imagem
-      - envia para todos os grupos
-    Retorna 1 se enviou, 0 se não enviou.
-    """
     if not group_ids:
         print("[worker] offers: nenhum grupo configurado, pulando.")
         return 0
 
     limit_query = int(os.getenv("PRODUCTS_OFFER_LIMIT", "50"))
-    max_dim = int(os.getenv("OFFERS_IMAGE_MAX_DIM", "1280"))
-    quality = int(os.getenv("OFFERS_IMAGE_QUALITY", "70"))
-    max_bytes = int(os.getenv("OFFERS_IMAGE_MAX_BYTES", "850000"))
 
     stmt = (
         select(ProductORM)
@@ -988,27 +886,19 @@ def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
     )
 
     try:
-        original_bytes = fetch_image_bytes_from_storage(chosen_cover_key)
-
-        body = image_bytes_to_data_uri_jpeg_optimized(
-            original_bytes,
-            max_dim=max_dim,
-            quality=quality,
-            max_bytes=max_bytes,
-        )
+        image_url = resolve_image_to_public_url(chosen_cover_key)
 
         for group_to in group_ids:
-            send_whatsapp_group_file_datauri(
-                to_group=group_to,
-                type_="image",
-                title=title,
-                body=body,
-            )
+            # 1) manda o texto com detalhes
+            send_whatsapp_text(to=group_to, body=title)
+
+            # 2) manda a imagem via URL
+            send_whatsapp_media(to=group_to, type_="image", file_url=image_url)
 
         print(f"[worker] offers(hourly): SENT product_id={p.id} to_groups={len(group_ids)}")
         return 1
 
-    except (BlibsendError, requests.RequestException, Exception) as e:
+    except (UazapiError, requests.RequestException, Exception) as e:
         print(f"[worker] offers(hourly): FAILED product_id={p.id}: {e}")
         return 0
 
@@ -1018,22 +908,21 @@ def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
 # ============================================================
 
 def run_loop() -> None:
-    to_number = os.getenv("BLIBSEND_DEFAULT_TO", "").strip()
+    to_number = os.getenv("UAZAPI_DEFAULT_TO", "").strip()
     if not to_number:
-        raise RuntimeError("Configure BLIBSEND_DEFAULT_TO no .env (numero destino do dono).")
+        raise RuntimeError("Configure UAZAPI_DEFAULT_TO no .env (numero destino do dono).")
 
-    group_to_raw = os.getenv("BLIBSEND_PRODUCTS_GROUP_TO", "").strip()
+    group_to_raw = os.getenv("UAZAPI_PRODUCTS_GROUP_TO", "").strip()
     group_ids = parse_group_ids(group_to_raw)
     if not group_ids:
         raise RuntimeError(
-            "Configure BLIBSEND_PRODUCTS_GROUP_TO no .env. "
+            "Configure UAZAPI_PRODUCTS_GROUP_TO no .env. "
             "Ex: 1203...@g.us,1203...@g.us ou JSON [\"...\"]"
         )
 
     interval = int(os.getenv("WORKER_INTERVAL_SECONDS", "30"))
     days = int(os.getenv("PROMISSORY_REMINDER_DAYS", "5"))
 
-    # ✅ janela 07h -> 21h (1 por hora)
     offers_start_hour = int(os.getenv("OFFERS_START_HOUR", "7"))
     offers_end_hour = int(os.getenv("OFFERS_END_HOUR", "21"))
     offer_limit = int(os.getenv("PRODUCTS_OFFER_LIMIT", "50"))
@@ -1080,13 +969,11 @@ def run_loop() -> None:
                 db.rollback()
                 print(f"[worker] ERROR process_weekly_report: {ex}")
 
-            # ✅ OFERTAS por hora (07h->21h)
             try:
                 now_local_dt = datetime.now()
                 if offers_can_send_now(now_local_dt, start_hour=offers_start_hour, end_hour=offers_end_hour):
                     d = process_hourly_product_offer(db, group_ids)
                     if d > 0:
-                        # marca somente se enviou
                         mark_offers_sent_this_hour(now_local_dt)
             except Exception as ex:
                 db.rollback()
@@ -1108,4 +995,3 @@ if __name__ == "__main__":
         run_loop()
     except KeyboardInterrupt:
         print("[worker] stopped (Ctrl+C)")
-
