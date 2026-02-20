@@ -908,6 +908,9 @@ def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
 # ============================================================
 
 def run_loop() -> None:
+    print("[worker] UAZAPI_DEFAULT_TO=", repr(os.getenv("UAZAPI_DEFAULT_TO")))
+    print("[worker] UAZAPI_TOKEN exists? ", bool((os.getenv("UAZAPI_TOKEN") or "").strip()))
+    print("[worker] BLIBSEND_DEFAULT_TO=", repr(os.getenv("BLIBSEND_DEFAULT_TO")))
     to_number = os.getenv("UAZAPI_DEFAULT_TO", "").strip()
     if not to_number:
         raise RuntimeError("Configure UAZAPI_DEFAULT_TO no .env (numero destino do dono).")
@@ -995,3 +998,4 @@ if __name__ == "__main__":
         run_loop()
     except KeyboardInterrupt:
         print("[worker] stopped (Ctrl+C)")
+
