@@ -34,6 +34,7 @@ class PaymentType(str, enum.Enum):
     PIX = "PIX"
     CARD = "CARD"
     PROMISSORY = "PROMISSORY"
+    FINANCING = "FINANCING"
 
 class SaleStatus(str, enum.Enum):
     DRAFT = "DRAFT"
