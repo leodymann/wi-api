@@ -29,7 +29,7 @@ from app.infra.models import (
     ProductStatus,
 )
 
-# ✅ UAZAPI (novo)
+# ✅ UAZAPI
 from app.integrations.uazapi import (
     UazapiError,
     send_whatsapp_text,
@@ -58,7 +58,7 @@ def today_local_date() -> date:
 
 
 # ============================================================
-# ✅ CONTROLE DE OFERTAS: 1 por hora (07h->21h)
+# ✅ CONTROLE DE OFERTAS: 1 por hora + sem repetir produto no dia
 # ============================================================
 
 def _load_offers_hourly_state() -> dict:
@@ -84,9 +84,11 @@ def offers_can_send_now(now_local: datetime, *, start_hour: int, end_hour: int) 
     state = _load_offers_hourly_state()
     today = now_local.date().isoformat()
 
+    # virou o dia -> pode enviar
     if state.get("date") != today:
         return True
 
+    # já enviou nesta hora?
     if state.get("last_hour_sent") == now_local.hour:
         return False
 
@@ -94,18 +96,46 @@ def offers_can_send_now(now_local: datetime, *, start_hour: int, end_hour: int) 
 
 
 def mark_offers_sent_this_hour(now_local: datetime, *, product_id: Optional[int] = None) -> None:
-    state = {
-        "date": now_local.date().isoformat(),
-        "last_hour_sent": now_local.hour,
-        "sent_at_utc": now_utc().isoformat(),
-    }
+    """
+    Marca envio na hora e registra product_id no conjunto do dia
+    para NÃO repetir o mesmo produto no mesmo dia.
+    """
+    state = _load_offers_hourly_state()
+    today = now_local.date().isoformat()
+
+    # se virou o dia, reseta
+    if state.get("date") != today:
+        state = {"date": today, "sent_product_ids": []}
+
+    sent_ids = state.get("sent_product_ids")
+    if not isinstance(sent_ids, list):
+        sent_ids = []
+
+    sent_set = set()
+    for x in sent_ids:
+        try:
+            sent_set.add(int(x))
+        except Exception:
+            pass
+
     if product_id is not None:
-        state["last_product_id"] = int(product_id)
+        sent_set.add(int(product_id))
+
+    state.update(
+        {
+            "date": today,
+            "last_hour_sent": now_local.hour,
+            "sent_at_utc": now_utc().isoformat(),
+            "sent_product_ids": sorted(sent_set),
+            "last_product_id": int(product_id) if product_id is not None else state.get("last_product_id"),
+        }
+    )
+
     _save_offers_hourly_state(state)
 
 
 # ============================================================
-# HELPERS GERAIS
+# HELPERS
 # ============================================================
 
 def compute_backoff_seconds(tries: int) -> int:
@@ -171,9 +201,6 @@ def format_br_phone(phone: str) -> str:
 
 
 def phone_to_uazapi_number(phone: str) -> str:
-    """
-    Uazapi aceita telefone em dígitos (ex: 5583987157461).
-    """
     digits = "".join(ch for ch in (phone or "") if ch.isdigit())
     if not digits:
         return ""
@@ -230,7 +257,7 @@ def _commit_row(db: Session, row) -> None:
 
 
 # ============================================================
-# ✅ RELATÓRIO SEMANAL
+# ✅ RELATÓRIO SEMANAL (mantido; tolerante ao FINANCING)
 # ============================================================
 
 def week_start_end_local(today: date) -> tuple[date, date]:
@@ -325,7 +352,9 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     pix_total = sum_by_payment(PaymentType.PIX)
     card_total = sum_by_payment(PaymentType.CARD)
     prom_total = sum_by_payment(PaymentType.PROMISSORY)
-    financing_total = sum_by_payment(PaymentType.FINANCING)
+
+    pt_fin = getattr(PaymentType, "FINANCING", None)
+    financing_total = sum_by_payment(pt_fin) if pt_fin else Decimal("0")
 
     q_sales_canceled = (
         select(func.count(SaleORM.id))
@@ -386,7 +415,6 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     fin_canceled_total = fin_sum_status(FinanceStatus.CANCELED)
 
     has_fin_payment_type = hasattr(FinanceORM, "payment_type")
-
     fin_cash_week = fin_pix_week = fin_card_week = fin_prom_week = fin_financing_week = Decimal("0")
 
     if has_fin_payment_type:
@@ -408,7 +436,7 @@ def process_weekly_report(db: Session, to_number: str) -> int:
         fin_pix_week = fin_week_sum_by_payment(PaymentType.PIX)
         fin_card_week = fin_week_sum_by_payment(PaymentType.CARD)
         fin_prom_week = fin_week_sum_by_payment(PaymentType.PROMISSORY)
-        fin_financing_week = fin_week_sum_by_payment(PaymentType.FINANCING)
+        fin_financing_week = fin_week_sum_by_payment(pt_fin) if pt_fin else Decimal("0")
 
     period = f"{start_d.strftime('%d/%m')} a {end_d.strftime('%d/%m')}"
 
@@ -420,7 +448,7 @@ def process_weekly_report(db: Session, to_number: str) -> int:
             f"   - Pix: {format_brl(fin_pix_week)}\n"
             f"   - Cartão: {format_brl(fin_card_week)}\n"
             f"   - Promissória: {format_brl(fin_prom_week)}\n"
-            f"   - Financiamento: {format_brl(fin_financing_week)}\n"
+            + (f"   - Financiamento: {format_brl(fin_financing_week)}\n" if pt_fin else "")
         )
 
     msg = (
@@ -439,7 +467,8 @@ def process_weekly_report(db: Session, to_number: str) -> int:
         f"• Pix: {format_brl(pix_total)}\n"
         f"• Cartão: {format_brl(card_total)}\n"
         f"• Promissória: {format_brl(prom_total)}\n"
-        f"• Financiamento: {format_brl(financing_total)}\n\n"
+        + (f"• Financiamento: {format_brl(financing_total)}\n" if pt_fin else "") +
+        "\n"
         f"✅ *Recebimentos (parcelas pagas)*\n"
         f"• Qtd: {installments_paid_count}\n"
         f"• Total recebido: *{format_brl(received_installments)}*\n\n"
@@ -462,365 +491,11 @@ def process_weekly_report(db: Session, to_number: str) -> int:
 
 
 # ============================================================
-# PROCESSOS EXISTENTES
-# ============================================================
-
-def process_finance(db: Session, to_number: str) -> int:
-    today = today_local_date()
-
-    stmt = (
-        select(FinanceORM)
-        .where(
-            and_(
-                FinanceORM.status == FinanceStatus.PENDING,
-                FinanceORM.due_date <= today,
-                or_(FinanceORM.wpp_status.is_(None), FinanceORM.wpp_status != WppSendStatus.SENT),
-                or_(
-                    FinanceORM.wpp_next_retry_at.is_(None),
-                    FinanceORM.wpp_next_retry_at <= now_utc(),
-                ),
-            )
-        )
-        .order_by(FinanceORM.due_date.asc(), FinanceORM.id.asc())
-        .limit(50)
-    )
-
-    rows = db.execute(stmt).scalars().all()
-    sent = 0
-
-    for f in rows:
-        if not can_try(f.wpp_status, f.wpp_next_retry_at):
-            continue
-
-        f.wpp_status = WppSendStatus.SENDING
-        db.flush()
-        _commit_row(db, f)
-
-        msg = (
-            "*📌 Novo Conta Adicionada!!!*\n"
-            f"🏦 Empresa: {f.company}\n"
-            f"💰 Valor: {format_brl(f.amount)}\n"
-            f"📆 Venc.: {f.due_date}\n"
-        )
-
-        try:
-            send_whatsapp_text(to=to_number, body=msg)
-
-            f.wpp_status = WppSendStatus.SENT
-            f.wpp_sent_at = now_utc()
-            f.wpp_last_error = None
-            f.wpp_next_retry_at = None
-            sent += 1
-
-            db.flush()
-            _commit_row(db, f)
-
-        except UazapiError as e:
-            mark_failed_generic(
-                row=f,
-                tries_field="wpp_tries",
-                status_field="wpp_status",
-                error_field="wpp_last_error",
-                next_retry_field="wpp_next_retry_at",
-                err=str(e),
-            )
-            db.flush()
-            _commit_row(db, f)
-
-    return sent
-
-
-def process_installments_due_soon(db: Session, to_number: str) -> int:
-    days = int(os.getenv("PROMISSORY_REMINDER_DAYS", "5"))
-    today = today_local_date()
-    target = today + timedelta(days=days)
-
-    stmt = (
-        select(InstallmentORM)
-        .options(
-            selectinload(InstallmentORM.promissory).selectinload(PromissoryORM.client),
-            selectinload(InstallmentORM.promissory).selectinload(PromissoryORM.product),
-            selectinload(InstallmentORM.promissory)
-            .selectinload(PromissoryORM.sale)
-            .selectinload(SaleORM.product),
-        )
-        .where(
-            and_(
-                InstallmentORM.status == InstallmentStatus.PENDING,
-                InstallmentORM.due_date == target,
-                or_(InstallmentORM.wa_due_status.is_(None), InstallmentORM.wa_due_status != WppSendStatus.SENT),
-                or_(
-                    InstallmentORM.wa_due_next_retry_at.is_(None),
-                    InstallmentORM.wa_due_next_retry_at <= now_utc(),
-                ),
-            )
-        )
-        .order_by(InstallmentORM.due_date.asc(), InstallmentORM.id.asc())
-        .limit(200)
-    )
-
-    rows = db.execute(stmt).scalars().all()
-    sent = 0
-
-    for inst in rows:
-        if not can_try(inst.wa_due_status, inst.wa_due_next_retry_at):
-            continue
-
-        inst.wa_due_status = WppSendStatus.SENDING
-        db.flush()
-        _commit_row(db, inst)
-
-        prom = inst.promissory
-        client = prom.client if prom else None
-
-        product = None
-        if prom is not None:
-            product = prom.product
-            if product is None and prom.sale is not None:
-                product = prom.sale.product
-
-        client_name = (client.name if client else "-") or "-"
-        client_phone = format_br_phone(client.phone if client else "")
-
-        moto_label = f"{product.brand} {product.model} ({product.year})" if product else "Produto -"
-        due_str = inst.due_date.strftime("%d/%m/%Y")
-
-        msg = (
-            "📅 Lembrete!!!\n"
-            f"👤 Cliente: {client_name}\n"
-            f"📞 Telefone: {client_phone}\n"
-            f"🏍️ Modelo: {moto_label}\n"
-            f"💰 Valor: {format_brl(inst.amount)}\n"
-            f"📆 Venc.: {due_str}\n"
-        )
-
-        try:
-            send_whatsapp_text(to=to_number, body=msg)
-
-            inst.wa_due_status = WppSendStatus.SENT
-            inst.wa_due_sent_at = now_utc()
-            inst.wa_due_last_error = None
-            inst.wa_due_next_retry_at = None
-            sent += 1
-
-            db.flush()
-            _commit_row(db, inst)
-
-        except UazapiError as e:
-            tries = int(inst.wa_due_tries or 0) + 1
-            inst.wa_due_tries = tries
-            inst.wa_due_status = WppSendStatus.FAILED
-            inst.wa_due_last_error = str(e)[:500]
-            inst.wa_due_next_retry_at = now_utc() + timedelta(seconds=compute_backoff_seconds(tries))
-
-            db.flush()
-            _commit_row(db, inst)
-
-    return sent
-
-
-def process_installments_due_today_to_client(db: Session) -> int:
-    enabled = os.getenv("DUE_TODAY_SEND_ENABLED", "1").strip() in ("1", "true", "True")
-    if not enabled:
-        return 0
-
-    pix_key = (os.getenv("PIX_KEY") or "").strip()
-    pix_receiver = (os.getenv("PIX_RECEIVER_NAME") or "Wesley Motos").strip()
-    pix_prefix = (os.getenv("PIX_MESSAGE_PREFIX") or "Pagamento parcela").strip()
-
-    if not pix_key:
-        print("[worker] DUE_TODAY: PIX_KEY não configurado, pulando.")
-        return 0
-
-    today = today_local_date()
-
-    stmt = (
-        select(InstallmentORM)
-        .options(
-            selectinload(InstallmentORM.promissory).selectinload(PromissoryORM.client),
-            selectinload(InstallmentORM.promissory).selectinload(PromissoryORM.product),
-            selectinload(InstallmentORM.promissory)
-            .selectinload(PromissoryORM.sale)
-            .selectinload(SaleORM.product),
-        )
-        .where(
-            and_(
-                InstallmentORM.status == InstallmentStatus.PENDING,
-                InstallmentORM.due_date == today,
-                InstallmentORM.wa_today_status != WppSendStatus.SENT,
-                InstallmentORM.wa_today_status != WppSendStatus.SENDING,
-                or_(
-                    InstallmentORM.wa_today_next_retry_at.is_(None),
-                    InstallmentORM.wa_today_next_retry_at <= now_utc(),
-                ),
-            )
-        )
-        .order_by(InstallmentORM.id.asc())
-        .limit(300)
-    )
-
-    rows = db.execute(stmt).scalars().all()
-    sent = 0
-
-    for inst in rows:
-        prom = inst.promissory
-        client = prom.client if prom else None
-        if not client:
-            continue
-
-        client_to = phone_to_uazapi_number(client.phone or "")
-        if not client_to:
-            continue
-
-        if not can_try(inst.wa_today_status, inst.wa_today_next_retry_at):
-            continue
-
-        inst.wa_today_status = WppSendStatus.SENDING
-        db.flush()
-        _commit_row(db, inst)
-
-        product = None
-        if prom is not None:
-            product = prom.product
-            if product is None and prom.sale is not None:
-                product = prom.sale.product
-
-        moto_label = f"{product.brand} {product.model} ({product.year})" if product else "sua compra"
-        due_str = inst.due_date.strftime("%d/%m/%Y")
-        client_name = (client.name or "").strip() or "Cliente"
-
-        msg = (
-            f"Olá, {client_name}! 👋\n"
-            f"Hoje ({due_str}) vence sua parcela de {moto_label}.\n\n"
-            f"💰 Valor: *{format_brl(inst.amount)}*\n"
-            f"🔑 Chave Pix: `{pix_key}`\n"
-            f"👤 Favorecido: {pix_receiver}\n"
-            f"📝 Descrição: {pix_prefix} {moto_label} ({due_str})\n\n"
-            "Assim que pagar, responda com o comprovante. Obrigado!"
-        )
-
-        try:
-            send_whatsapp_text(to=client_to, body=msg)
-
-            inst.wa_today_status = WppSendStatus.SENT
-            inst.wa_today_sent_at = now_utc()
-            inst.wa_today_last_error = None
-            inst.wa_today_next_retry_at = None
-            sent += 1
-
-            db.flush()
-            _commit_row(db, inst)
-
-        except UazapiError as e:
-            tries = int(inst.wa_today_tries or 0) + 1
-            inst.wa_today_tries = tries
-            inst.wa_today_status = WppSendStatus.FAILED
-            inst.wa_today_last_error = str(e)[:500]
-            inst.wa_today_next_retry_at = now_utc() + timedelta(seconds=compute_backoff_seconds(tries))
-
-            db.flush()
-            _commit_row(db, inst)
-
-    return sent
-
-
-def process_installments_overdue(db: Session, to_number: str) -> int:
-    today = today_local_date()
-
-    stmt = (
-        select(InstallmentORM)
-        .options(
-            selectinload(InstallmentORM.promissory).selectinload(PromissoryORM.client),
-            selectinload(InstallmentORM.promissory).selectinload(PromissoryORM.product),
-            selectinload(InstallmentORM.promissory)
-            .selectinload(PromissoryORM.sale)
-            .selectinload(SaleORM.product),
-        )
-        .where(
-            and_(
-                InstallmentORM.status == InstallmentStatus.PENDING,
-                InstallmentORM.due_date < today,
-                or_(InstallmentORM.wa_overdue_status.is_(None), InstallmentORM.wa_overdue_status != WppSendStatus.SENT),
-                or_(
-                    InstallmentORM.wa_overdue_next_retry_at.is_(None),
-                    InstallmentORM.wa_overdue_next_retry_at <= now_utc(),
-                ),
-            )
-        )
-        .order_by(InstallmentORM.due_date.asc(), InstallmentORM.id.asc())
-        .limit(100)
-    )
-
-    rows = db.execute(stmt).scalars().all()
-    sent = 0
-
-    for inst in rows:
-        if not can_try(inst.wa_overdue_status, inst.wa_overdue_next_retry_at):
-            continue
-
-        inst.wa_overdue_status = WppSendStatus.SENDING
-        db.flush()
-        _commit_row(db, inst)
-
-        prom = inst.promissory
-        client = prom.client if prom else None
-
-        product = None
-        if prom is not None:
-            product = prom.product
-            if product is None and prom.sale is not None:
-                product = prom.sale.product
-
-        client_name = (client.name if client else "-") or "-"
-        client_phone = format_br_phone(client.phone if client else "")
-
-        moto_label = f"{product.brand} {product.model} ({product.year})" if product else "Produto -"
-        due_str = inst.due_date.strftime("%d/%m/%Y")
-
-        msg = (
-            f"⚠️ *PARCELA ATRASADA - {moto_label}*\n"
-            f"👤 Cliente: {client_name}\n"
-            f"📞 Telefone: {client_phone}\n"
-            f"💰 Parcela: {format_brl(inst.amount)} • Venc: {due_str}"
-        )
-
-        try:
-            send_whatsapp_text(to=to_number, body=msg)
-
-            inst.wa_overdue_status = WppSendStatus.SENT
-            inst.wa_overdue_sent_at = now_utc()
-            inst.wa_overdue_last_error = None
-            inst.wa_overdue_next_retry_at = None
-            sent += 1
-
-            db.flush()
-            _commit_row(db, inst)
-
-        except UazapiError as e:
-            tries = int(inst.wa_overdue_tries or 0) + 1
-            inst.wa_overdue_tries = tries
-            inst.wa_overdue_status = WppSendStatus.FAILED
-            inst.wa_overdue_last_error = str(e)[:500]
-            inst.wa_overdue_next_retry_at = now_utc() + timedelta(seconds=compute_backoff_seconds(tries))
-
-            db.flush()
-            _commit_row(db, inst)
-
-    return sent
-
-
-# ============================================================
-# ✅ OFERTAS: texto + imagem via URL (Uazapi /send/media)
+# ✅ OFERTAS: imagem + legenda (caption) em UMA mensagem
+# - não repetir produto no dia
 # ============================================================
 
 def resolve_image_to_public_url(image_url_or_key: str) -> str:
-    """
-    Uazapi precisa de URL em 'file'. Então:
-      - se já for http(s), usa direto
-      - se for key do S3, gera presigned
-      - se for /static/, não dá URL pública aqui (seu worker não é servidor).
-        (você pode trocar isso depois por uma URL pública real)
-    """
     u = (image_url_or_key or "").strip()
     if not u:
         raise UazapiError("Imagem sem url/key.")
@@ -829,14 +504,15 @@ def resolve_image_to_public_url(image_url_or_key: str) -> str:
         return u
 
     if u.startswith("/static/"):
-        # aqui você teria que ter um domínio público apontando pro seu /static
         raise UazapiError("Imagem local /static não tem URL pública para Uazapi. Use S3 (key) ou URL http(s).")
 
-    # assume S3 key
     return presign_get_url(u, expires_seconds=3600)
 
 
 def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
+    """
+    Retorna o product_id enviado (>0) ou 0 se não enviou.
+    """
     if not group_ids:
         print("[worker] offers: nenhum grupo configurado, pulando.")
         return 0
@@ -854,10 +530,27 @@ def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
     products = db.execute(stmt).scalars().all()
     print(f"[worker] offers(hourly): scanning {len(products)} IN_STOCK (query_limit={limit_query}, groups={len(group_ids)})")
 
+    # ✅ não repetir produto no mesmo dia
+    state = _load_offers_hourly_state()
+    today = datetime.now().date().isoformat()
+    sent_today = state.get("sent_product_ids") if state.get("date") == today else []
+    if not isinstance(sent_today, list):
+        sent_today = []
+
+    sent_today_set = set()
+    for x in sent_today:
+        try:
+            sent_today_set.add(int(x))
+        except Exception:
+            pass
+
     chosen: Optional[ProductORM] = None
     chosen_cover_key: Optional[str] = None
 
     for p in products:
+        if p.id in sent_today_set:
+            continue  # ✅ já enviado hoje
+
         images = sorted(p.images or [], key=lambda x: x.position or 9999)
         if not images:
             continue
@@ -872,11 +565,14 @@ def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
         break
 
     if not chosen or not chosen_cover_key:
-        print("[worker] offers(hourly): nenhum produto com imagem encontrado, não enviou.")
+        if sent_today_set:
+            print(f"[worker] offers(hourly): todos os produtos com imagem já foram enviados hoje ({len(sent_today_set)}).")
+        else:
+            print("[worker] offers(hourly): nenhum produto com imagem encontrado, não enviou.")
         return 0
 
     p = chosen
-    title = (
+    caption = (
         "🔥 *OFERTA DO DIA 🔥*\n"
         f"🏍️ Modelo: {p.brand} {p.model}\n"
         f"🎨 Cor: {p.color}\n"
@@ -888,15 +584,17 @@ def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
     try:
         image_url = resolve_image_to_public_url(chosen_cover_key)
 
+        # ✅ UMA mensagem: imagem + legenda (text)
         for group_to in group_ids:
-            # 1) manda o texto com detalhes
-            send_whatsapp_text(to=group_to, body=title)
-
-            # 2) manda a imagem via URL
-            send_whatsapp_media(to=group_to, type_="image", file_url=image_url)
+            send_whatsapp_media(
+                to=group_to,
+                type_="image",
+                file_url=image_url,
+                text=caption,
+            )
 
         print(f"[worker] offers(hourly): SENT product_id={p.id} to_groups={len(group_ids)}")
-        return 1
+        return int(p.id)
 
     except (UazapiError, requests.RequestException, Exception) as e:
         print(f"[worker] offers(hourly): FAILED product_id={p.id}: {e}")
@@ -911,6 +609,7 @@ def run_loop() -> None:
     print("[worker] UAZAPI_DEFAULT_TO=", repr(os.getenv("UAZAPI_DEFAULT_TO")))
     print("[worker] UAZAPI_TOKEN exists? ", bool((os.getenv("UAZAPI_TOKEN") or "").strip()))
     print("[worker] BLIBSEND_DEFAULT_TO=", repr(os.getenv("BLIBSEND_DEFAULT_TO")))
+
     to_number = os.getenv("UAZAPI_DEFAULT_TO", "").strip()
     if not to_number:
         raise RuntimeError("Configure UAZAPI_DEFAULT_TO no .env (numero destino do dono).")
@@ -972,12 +671,16 @@ def run_loop() -> None:
                 db.rollback()
                 print(f"[worker] ERROR process_weekly_report: {ex}")
 
+            # ✅ OFERTAS por hora (07h->21h), sem repetir no dia, e imagem com legenda
             try:
                 now_local_dt = datetime.now()
                 if offers_can_send_now(now_local_dt, start_hour=offers_start_hour, end_hour=offers_end_hour):
-                    d = process_hourly_product_offer(db, group_ids)
-                    if d > 0:
-                        mark_offers_sent_this_hour(now_local_dt)
+                    sent_product_id = process_hourly_product_offer(db, group_ids)
+                    if sent_product_id > 0:
+                        mark_offers_sent_this_hour(now_local_dt, product_id=sent_product_id)
+                        d = 1
+                    else:
+                        d = 0
             except Exception as ex:
                 db.rollback()
                 print(f"[worker] ERROR process_hourly_product_offer: {ex}")
@@ -998,4 +701,3 @@ if __name__ == "__main__":
         run_loop()
     except KeyboardInterrupt:
         print("[worker] stopped (Ctrl+C)")
-
