@@ -16,12 +16,6 @@ from dotenv import load_dotenv
 from sqlalchemy import and_, or_, select, func
 from sqlalchemy.orm import Session, selectinload
 
-# ✅ PDF (requirements.txt: reportlab>=4.0.0)
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.lib import colors
-from reportlab.pdfgen import canvas
-
 from app.infra.db import SessionLocal
 from app.infra.models import (
     FinanceORM,
@@ -37,7 +31,6 @@ from app.infra.models import (
     ProductStatus,
 )
 
-# ✅ UAZAPI
 from app.integrations.uazapi import (
     UazapiError,
     send_whatsapp_text,
@@ -66,7 +59,7 @@ def today_local_date() -> date:
 
 
 # ============================================================
-# ✅ CONTROLE DE OFERTAS: 1 por hora (07h->21h) + sem repetir produto no dia
+# ✅ CONTROLE DE OFERTAS: 1 por hora + sem repetir produto no dia
 # ============================================================
 
 def _load_offers_hourly_state() -> dict:
@@ -92,11 +85,9 @@ def offers_can_send_now(now_local: datetime, *, start_hour: int, end_hour: int) 
     state = _load_offers_hourly_state()
     today = now_local.date().isoformat()
 
-    # virou o dia -> pode enviar
     if state.get("date") != today:
         return True
 
-    # já enviou nesta hora?
     if state.get("last_hour_sent") == now_local.hour:
         return False
 
@@ -104,16 +95,9 @@ def offers_can_send_now(now_local: datetime, *, start_hour: int, end_hour: int) 
 
 
 def mark_offers_sent_this_hour(now_local: datetime, *, product_id: Optional[int] = None) -> None:
-    """
-    Guarda:
-      - date
-      - last_hour_sent
-      - sent_product_ids (para não repetir no mesmo dia)
-    """
     state = _load_offers_hourly_state()
     today = now_local.date().isoformat()
 
-    # virou o dia -> reseta o conjunto
     if state.get("date") != today:
         state = {"date": today, "sent_product_ids": []}
 
@@ -144,7 +128,7 @@ def mark_offers_sent_this_hour(now_local: datetime, *, product_id: Optional[int]
 
 
 # ============================================================
-# HELPERS GERAIS
+# HELPERS
 # ============================================================
 
 def compute_backoff_seconds(tries: int) -> int:
@@ -266,156 +250,212 @@ def _commit_row(db: Session, row) -> None:
 
 
 # ============================================================
-# ✅ PDF (simples, profissional, sem poluição)
+# ✅ PDF puro (sem libs) — layout limpo e claro
 # ============================================================
 
-def _pdf_draw_kpi_box(
-    c: canvas.Canvas,
-    *,
-    x: float,
-    y: float,
-    w: float,
-    h: float,
-    title: str,
-    value: str,
-    subtitle: Optional[str] = None,
-) -> None:
-    c.setFillColor(colors.whitesmoke)
-    c.setStrokeColor(colors.lightgrey)
-    c.setLineWidth(0.8)
-    c.roundRect(x, y - h, w, h, 6, stroke=1, fill=1)
-
-    c.setFillColor(colors.black)
-    c.setFont("Helvetica", 9)
-    c.drawString(x + 10, y - 16, title)
-
-    c.setFont("Helvetica-Bold", 12)
-    c.drawString(x + 10, y - 34, value)
-
-    if subtitle:
-        c.setFont("Helvetica", 8)
-        c.setFillColor(colors.grey)
-        c.drawString(x + 10, y - 48, subtitle)
-        c.setFillColor(colors.black)
+def _pdf_escape(s: str) -> str:
+    # escapa \ ( ) para string do PDF
+    return (s or "").replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
-def _pdf_draw_section_title(c: canvas.Canvas, x: float, y: float, text: str) -> None:
-    c.setFont("Helvetica-Bold", 10)
-    c.setFillColor(colors.black)
-    c.drawString(x, y, text)
-    c.setStrokeColor(colors.lightgrey)
-    c.setLineWidth(0.6)
-    c.line(x, y - 6, x + 180 * mm, y - 6)
-
-
-def _pdf_draw_kv_list(
-    c: canvas.Canvas,
-    *,
-    x: float,
-    y: float,
-    items: list[tuple[str, str]],
-    line_h: float = 14,
-) -> float:
-    c.setFont("Helvetica", 9)
-    yy = y
-    for k, v in items:
-        c.setFillColor(colors.grey)
-        c.drawString(x, yy, k)
-        c.setFillColor(colors.black)
-        c.drawRightString(x + 180 * mm, yy, v)
-        yy -= line_h
-    return yy
+def _wrap_text(s: str, max_chars: int) -> list[str]:
+    s = (s or "").strip()
+    if not s:
+        return [""]
+    words = s.split()
+    lines: list[str] = []
+    cur = ""
+    for w in words:
+        if not cur:
+            cur = w
+            continue
+        if len(cur) + 1 + len(w) <= max_chars:
+            cur += " " + w
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
 
 
 def build_weekly_report_pdf_bytes(
     *,
     store_name: str,
     period_label: str,
-    generated_at_local: str,
-    kpis: dict[str, str],
-    sales_block: list[tuple[str, str]],
-    payments_block: list[tuple[str, str]],
-    installments_block: list[tuple[str, str]],
-    finance_block: list[tuple[str, str]],
+    generated_at: str,
+    kpis: list[tuple[str, str]],
+    sections: list[tuple[str, list[tuple[str, str]]]],
 ) -> bytes:
     """
-    PDF A4 com layout limpo:
-      - Cabeçalho + período
-      - KPIs em cards
-      - Seções em lista (chave/valor)
+    PDF A4 (595x842 pt), com:
+      - cabeçalho
+      - KPIs em "cards" simples
+      - seções chave/valor
     """
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    w, h = A4
+    W, H = 595, 842
+    margin_x = 46
+    y = H - 60
 
-    margin_x = 18 * mm
-    y = h - 18 * mm
+    cmds: list[str] = []
+
+    def set_stroke_gray(g: float):
+        cmds.append(f"{g:.3f} G")
+
+    def set_fill_gray(g: float):
+        cmds.append(f"{g:.3f} g")
+
+    def rect(x: float, y_top: float, w: float, h: float, fill: bool, stroke: bool):
+        # PDF re usa canto inferior esquerdo, então convertemos
+        y0 = y_top - h
+        cmds.append(f"{x:.2f} {y0:.2f} {w:.2f} {h:.2f} re")
+        if fill and stroke:
+            cmds.append("B")
+        elif fill:
+            cmds.append("f")
+        elif stroke:
+            cmds.append("S")
+        else:
+            cmds.append("n")
+
+    def line(x1: float, y1: float, x2: float, y2: float):
+        cmds.append(f"{x1:.2f} {y1:.2f} m {x2:.2f} {y2:.2f} l S")
+
+    def text(font: str, size: int, x: float, y: float, s: str):
+        cmds.append("BT")
+        cmds.append(f"/{font} {size} Tf")
+        cmds.append(f"{x:.2f} {y:.2f} Td")
+        cmds.append(f"({_pdf_escape(s)}) Tj")
+        cmds.append("ET")
 
     # Header
-    c.setFillColor(colors.black)
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(margin_x, y, "Relatório Semanal")
-    c.setFont("Helvetica", 9)
-    c.setFillColor(colors.grey)
-    c.drawRightString(w - margin_x, y, store_name)
-    y -= 16
-
-    c.setFillColor(colors.black)
-    c.setFont("Helvetica", 9)
-    c.drawString(margin_x, y, f"Período: {period_label}")
-    c.setFillColor(colors.grey)
-    c.drawRightString(w - margin_x, y, f"Gerado em: {generated_at_local}")
-    y -= 18
+    set_fill_gray(0.0)
+    text("F1", 16, margin_x, y, "Relatório Semanal")
+    text("F2", 9, margin_x, y - 18, f"Período: {period_label}")
+    text("F2", 9, margin_x, y - 32, f"Gerado em: {generated_at}")
+    text("F2", 9, W - margin_x - 180, y, store_name)
+    y -= 52
 
     # KPI cards
-    card_h = 18 * mm
-    gap = 6 * mm
-    card_w = (w - margin_x * 2 - gap * 2) / 3
+    card_h = 54
+    gap = 10
+    card_w = (W - margin_x * 2 - gap * 2) / 3
 
-    _pdf_draw_kpi_box(c, x=margin_x, y=y, w=card_w, h=card_h, title="Vendas confirmadas", value=kpis["sales_count"])
-    _pdf_draw_kpi_box(c, x=margin_x + card_w + gap, y=y, w=card_w, h=card_h, title="Líquido vendido", value=kpis["sales_net"])
-    _pdf_draw_kpi_box(c, x=margin_x + (card_w + gap) * 2, y=y, w=card_w, h=card_h, title="Lucro estimado", value=kpis["profit_est"])
-    y -= (card_h + 10)
+    def kpi_card(ix: int, title_: str, value_: str, y_top: float):
+        x = margin_x + ix * (card_w + gap)
+        set_fill_gray(0.97)
+        set_stroke_gray(0.85)
+        rect(x, y_top, card_w, card_h, fill=True, stroke=True)
+        set_fill_gray(0.15)
+        text("F2", 9, x + 12, y_top - 18, title_)
+        set_fill_gray(0.0)
+        text("F1", 12, x + 12, y_top - 38, value_)
 
-    _pdf_draw_kpi_box(c, x=margin_x, y=y, w=card_w, h=card_h, title="Entradas", value=kpis["sales_entry"])
-    _pdf_draw_kpi_box(c, x=margin_x + card_w + gap, y=y, w=card_w, h=card_h, title="Recebimentos (parcelas)", value=kpis["inst_received"])
-    _pdf_draw_kpi_box(c, x=margin_x + (card_w + gap) * 2, y=y, w=card_w, h=card_h, title="Financeiro pendente", value=kpis["fin_pending"])
+    # primeira linha de KPIs (3)
+    row1 = kpis[:3]
+    row2 = kpis[3:6]
+
+    for i, (t, v) in enumerate(row1):
+        kpi_card(i, t, v, y)
     y -= (card_h + 14)
 
-    # Sections
-    _pdf_draw_section_title(c, margin_x, y, "Vendas")
-    y -= 22
-    y = _pdf_draw_kv_list(c, x=margin_x, y=y, items=sales_block)
-    y -= 8
+    for i, (t, v) in enumerate(row2):
+        kpi_card(i, t, v, y)
+    y -= (card_h + 18)
 
-    _pdf_draw_section_title(c, margin_x, y, "Por forma de pagamento (vendas - líquido)")
-    y -= 22
-    y = _pdf_draw_kv_list(c, x=margin_x, y=y, items=payments_block)
-    y -= 8
+    # Seções
+    def section_title(title_: str):
+        nonlocal y
+        set_fill_gray(0.0)
+        text("F1", 10, margin_x, y, title_)
+        set_stroke_gray(0.85)
+        line(margin_x, y - 6, W - margin_x, y - 6)
+        y -= 24
 
-    _pdf_draw_section_title(c, margin_x, y, "Parcelas")
-    y -= 22
-    y = _pdf_draw_kv_list(c, x=margin_x, y=y, items=installments_block)
-    y -= 8
+    def kv_table(items: list[tuple[str, str]]):
+        nonlocal y
+        for k, v in items:
+            if y < 80:
+                # sem paginação para manter simples; se precisar, dá pra implementar
+                break
+            set_fill_gray(0.35)
+            text("F2", 9, margin_x, y, f"{k}")
+            set_fill_gray(0.0)
+            text("F2", 9, W - margin_x - 220, y, f"{v}")
+            y -= 16
+        y -= 8
 
-    _pdf_draw_section_title(c, margin_x, y, "Financeiro")
-    y -= 22
-    y = _pdf_draw_kv_list(c, x=margin_x, y=y, items=finance_block)
-    y -= 8
+    for title_, items in sections:
+        section_title(title_)
+        kv_table(items)
 
     # Footer
-    c.setFont("Helvetica", 8)
-    c.setFillColor(colors.grey)
-    c.drawString(margin_x, 12 * mm, "Gerado automaticamente pelo WI Motos.")
-    c.drawRightString(w - margin_x, 12 * mm, "Página 1/1")
+    set_fill_gray(0.45)
+    text("F2", 8, margin_x, 28, "Gerado automaticamente pelo WI Motos.")
+    text("F2", 8, W - margin_x - 60, 28, "Página 1/1")
 
-    c.showPage()
-    c.save()
-    return buf.getvalue()
+    content = "\n".join(cmds).encode("utf-8")
+
+    # --- monta PDF básico ---
+    def obj(n: int, body: bytes) -> bytes:
+        return f"{n} 0 obj\n".encode() + body + b"\nendobj\n"
+
+    objects: list[bytes] = []
+
+    # 1) Catalog
+    objects.append(obj(1, b"<< /Type /Catalog /Pages 2 0 R >>"))
+
+    # 2) Pages
+    objects.append(obj(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"))
+
+    # 3) Page
+    page = (
+        b"<< /Type /Page /Parent 2 0 R "
+        b"/MediaBox [0 0 595 842] "
+        b"/Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> "
+        b"/Contents 6 0 R >>"
+    )
+    objects.append(obj(3, page))
+
+    # 4) Font bold
+    objects.append(obj(4, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>"))
+    # 5) Font regular
+    objects.append(obj(5, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"))
+
+    # 6) Content stream
+    stream = b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream"
+    objects.append(obj(6, stream))
+
+    # xref
+    pdf = io.BytesIO()
+    pdf.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+
+    offsets = [0]
+    for o in objects:
+        offsets.append(pdf.tell())
+        pdf.write(o)
+
+    xref_start = pdf.tell()
+    pdf.write(f"xref\n0 {len(offsets)}\n".encode())
+    pdf.write(b"0000000000 65535 f \n")
+    for off in offsets[1:]:
+        pdf.write(f"{off:010d} 00000 n \n".encode())
+
+    pdf.write(
+        (
+            "trailer\n"
+            f"<< /Size {len(offsets)} /Root 1 0 R >>\n"
+            "startxref\n"
+            f"{xref_start}\n"
+            "%%EOF\n"
+        ).encode("utf-8")
+    )
+
+    return pdf.getvalue()
 
 
 # ============================================================
-# ✅ RELATÓRIO SEMANAL (PDF via base64 /send/media document)
+# ✅ RELATÓRIO SEMANAL (PDF base64 via /send/media document)
 # ============================================================
 
 def week_start_end_local(today: date) -> tuple[date, date]:
@@ -463,9 +503,6 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     start_dt = datetime.combine(start_d, datetime.min.time())
     end_dt = datetime.combine(end_d + timedelta(days=1), datetime.min.time())  # exclusivo
 
-    # -------------------------
-    # VENDAS CONFIRMADAS
-    # -------------------------
     q_sales_confirmed = (
         select(
             func.count(SaleORM.id),
@@ -514,7 +551,6 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     card_total = sum_by_payment(PaymentType.CARD)
     prom_total = sum_by_payment(PaymentType.PROMISSORY)
 
-    # ✅ tolerante: se FINANCING não existir, fica 0
     pt_fin = getattr(PaymentType, "FINANCING", None)
     financing_total = sum_by_payment(pt_fin) if pt_fin else Decimal("0")
 
@@ -530,9 +566,6 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     )
     sales_canceled_count = int(db.execute(q_sales_canceled).scalar() or 0)
 
-    # -------------------------
-    # RECEBIMENTOS (PARCELAS PAGAS)
-    # -------------------------
     q_inst_paid = (
         select(
             func.count(InstallmentORM.id),
@@ -554,9 +587,6 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     installments_nominal = Decimal(str(inst_nominal_sum or "0"))
     received_installments = installments_paid_amount if installments_paid_amount > 0 else installments_nominal
 
-    # -------------------------
-    # FINANCEIRO (CRIADO NA SEMANA)
-    # -------------------------
     q_fin_created = (
         select(
             func.count(FinanceORM.id),
@@ -577,64 +607,55 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     fin_paid_total = fin_sum_status(FinanceStatus.PAID)
     fin_canceled_total = fin_sum_status(FinanceStatus.CANCELED)
 
-    # -------------------------
-    # PDF + envio
-    # -------------------------
     period = f"{start_d.strftime('%d/%m')} a {end_d.strftime('%d/%m')}"
     store_name = (os.getenv("PDF_STORE_NAME") or "Wesley Motos").strip()
-    generated_at_local = datetime.now().strftime("%d/%m/%Y %H:%M")
+    generated_at = datetime.now().strftime("%d/%m/%Y %H:%M")
 
-    kpis = {
-        "sales_count": str(sales_confirmed_count),
-        "sales_net": format_brl(sales_net),
-        "profit_est": format_brl(profit_estimated),
-        "sales_entry": format_brl(sales_entry),
-        "inst_received": format_brl(received_installments),
-        "fin_pending": format_brl(fin_pending_total),
-    }
-
-    sales_block = [
-        ("Quantidade", str(sales_confirmed_count)),
-        ("Bruto", format_brl(sales_total)),
-        ("Descontos", format_brl(sales_discount)),
-        ("Líquido (bruto - desconto)", format_brl(sales_net)),
-        ("Entradas", format_brl(sales_entry)),
+    kpis = [
+        ("Vendas confirmadas", str(sales_confirmed_count)),
+        ("Líquido vendido", format_brl(sales_net)),
         ("Lucro estimado", format_brl(profit_estimated)),
-        ("Canceladas", str(sales_canceled_count)),
+        ("Entradas", format_brl(sales_entry)),
+        ("Recebimentos (parcelas)", format_brl(received_installments)),
+        ("Financeiro pendente", format_brl(fin_pending_total)),
     ]
 
-    payments_block = [
-        ("Dinheiro", format_brl(cash_total)),
-        ("Pix", format_brl(pix_total)),
-        ("Cartão", format_brl(card_total)),
-        ("Promissória", format_brl(prom_total)),
-    ]
-    if pt_fin:
-        payments_block.append(("Financiamento", format_brl(financing_total)))
-
-    installments_block = [
-        ("Parcelas pagas (qtd)", str(installments_paid_count)),
-        ("Total recebido", format_brl(received_installments)),
-    ]
-
-    finance_block = [
-        ("Contas criadas na semana (qtd)", str(finance_created_count)),
-        ("Total criado na semana", format_brl(finance_created_total)),
-        ("Pendente (atual)", format_brl(fin_pending_total)),
-        ("Pago (atual)", format_brl(fin_paid_total)),
-        ("Cancelado (atual)", format_brl(fin_canceled_total)),
+    sections: list[tuple[str, list[tuple[str, str]]]] = [
+        ("Vendas", [
+            ("Quantidade", str(sales_confirmed_count)),
+            ("Bruto", format_brl(sales_total)),
+            ("Descontos", format_brl(sales_discount)),
+            ("Líquido (bruto - desconto)", format_brl(sales_net)),
+            ("Entradas", format_brl(sales_entry)),
+            ("Lucro estimado", format_brl(profit_estimated)),
+            ("Canceladas", str(sales_canceled_count)),
+        ]),
+        ("Por forma de pagamento (vendas - líquido)", [
+            ("Dinheiro", format_brl(cash_total)),
+            ("Pix", format_brl(pix_total)),
+            ("Cartão", format_brl(card_total)),
+            ("Promissória", format_brl(prom_total)),
+        ] + ([("Financiamento", format_brl(financing_total))] if pt_fin else [])),
+        ("Parcelas", [
+            ("Parcelas pagas (qtd)", str(installments_paid_count)),
+            ("Total recebido", format_brl(received_installments)),
+        ]),
+        ("Financeiro", [
+            ("Contas criadas na semana (qtd)", str(finance_created_count)),
+            ("Total criado na semana", format_brl(finance_created_total)),
+            ("Pendente (atual)", format_brl(fin_pending_total)),
+            ("Pago (atual)", format_brl(fin_paid_total)),
+            ("Cancelado (atual)", format_brl(fin_canceled_total)),
+        ]),
     ]
 
     try:
         pdf_bytes = build_weekly_report_pdf_bytes(
             store_name=store_name,
             period_label=period,
-            generated_at_local=generated_at_local,
+            generated_at=generated_at,
             kpis=kpis,
-            sales_block=sales_block,
-            payments_block=payments_block,
-            installments_block=installments_block,
-            finance_block=finance_block,
+            sections=sections,
         )
 
         b64 = base64.b64encode(pdf_bytes).decode("utf-8")
@@ -645,7 +666,7 @@ def process_weekly_report(db: Session, to_number: str) -> int:
         send_whatsapp_media(
             to=to_number,
             type_="document",
-            file_url=pdf_data_uri,          # ✅ base64 (data-uri)
+            file_url=pdf_data_uri,
             text=f"📊 Relatório semanal ({period})",
             doc_name=filename,
             mime_type="application/pdf",
@@ -663,7 +684,7 @@ def process_weekly_report(db: Session, to_number: str) -> int:
 
 
 # ============================================================
-# PROCESSOS EXISTENTES (iguais ao seu)
+# PROCESSOS EXISTENTES
 # ============================================================
 
 def process_finance(db: Session, to_number: str) -> int:
@@ -993,7 +1014,7 @@ def process_installments_overdue(db: Session, to_number: str) -> int:
 
 
 # ============================================================
-# ✅ OFERTAS: imagem + legenda (caption) + sem repetir no mesmo dia
+# ✅ OFERTAS: imagem + legenda + sem repetir no mesmo dia
 # ============================================================
 
 def resolve_image_to_public_url(image_url_or_key: str) -> str:
@@ -1011,12 +1032,6 @@ def resolve_image_to_public_url(image_url_or_key: str) -> str:
 
 
 def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
-    """
-    Retorna product_id (>0) se enviou, 0 se não enviou.
-    - escolhe o produto mais recente IN_STOCK com imagem
-    - NÃO repete o mesmo produto no mesmo dia (state file)
-    - envia imagem com legenda via /send/media (campo text)
-    """
     if not group_ids:
         print("[worker] offers: nenhum grupo configurado, pulando.")
         return 0
@@ -1173,7 +1188,6 @@ def run_loop() -> None:
                 db.rollback()
                 print(f"[worker] ERROR process_weekly_report: {ex}")
 
-            # ✅ OFERTAS por hora + sem repetir produto no dia
             try:
                 now_local_dt = datetime.now()
                 if offers_can_send_now(now_local_dt, start_hour=offers_start_hour, end_hour=offers_end_hour):
