@@ -9,7 +9,7 @@ import time
 import requests
 from datetime import datetime, timedelta, timezone, date
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Any
 from decimal import Decimal, ROUND_HALF_UP
 
 from dotenv import load_dotenv
@@ -48,14 +48,25 @@ STATE_DIR.mkdir(exist_ok=True)
 
 OFFERS_HOURLY_STATE_FILE = STATE_DIR / "offers_hourly_state.json"
 WEEKLY_REPORT_SENT_FILE = STATE_DIR / "weekly_report_sent.txt"
+MONTHLY_REPORT_SENT_FILE = STATE_DIR / "monthly_report_sent.txt"
+SALES_ALERT_STATE_FILE = STATE_DIR / "sales_confirmed_alert_state.json"
 
+
+# ============================================================
+# TIME
+# ============================================================
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
 def today_local_date() -> date:
+    # servidor em Fortaleza? se quiser forçar, use ZoneInfo.
     return datetime.now().date()
+
+
+def is_last_day_of_month(d: date) -> bool:
+    return (d + timedelta(days=1)).month != d.month
 
 
 # ============================================================
@@ -250,63 +261,31 @@ def _commit_row(db: Session, row) -> None:
 
 
 # ============================================================
-# ✅ PDF puro (sem libs) — layout limpo e claro
+# ✅ PDF (design futurista claro) - sem libs externas
 # ============================================================
 
 def _pdf_escape(s: str) -> str:
-    # escapa \ ( ) para string do PDF
     return (s or "").replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
 
 
-def _wrap_text(s: str, max_chars: int) -> list[str]:
-    s = (s or "").strip()
-    if not s:
-        return [""]
-    words = s.split()
-    lines: list[str] = []
-    cur = ""
-    for w in words:
-        if not cur:
-            cur = w
-            continue
-        if len(cur) + 1 + len(w) <= max_chars:
-            cur += " " + w
-        else:
-            lines.append(cur)
-            cur = w
-    if cur:
-        lines.append(cur)
-    return lines
-
-
-def build_weekly_report_pdf_bytes(
+def build_futuristic_light_pdf_bytes(
     *,
     store_name: str,
     period_label: str,
     generated_at: str,
     kpis: list[tuple[str, str]],
-    sections: list[tuple[str, list[tuple[str, str]]]],
+    payments: list[tuple[str, str]],
+    finance: list[tuple[str, str]],
+    footnote: str = "",
 ) -> bytes:
-    """
-    PDF A4 (595x842 pt), com:
-      - cabeçalho
-      - KPIs em "cards" simples
-      - seções chave/valor
-    """
     W, H = 595, 842
     margin_x = 46
-    y = H - 60
-
     cmds: list[str] = []
 
-    def set_stroke_gray(g: float):
-        cmds.append(f"{g:.3f} G")
-
-    def set_fill_gray(g: float):
-        cmds.append(f"{g:.3f} g")
+    def set_stroke_rgb(r, g, b): cmds.append(f"{r/255:.3f} {g/255:.3f} {b/255:.3f} RG")
+    def set_fill_rgb(r, g, b): cmds.append(f"{r/255:.3f} {g/255:.3f} {b/255:.3f} rg")
 
     def rect(x: float, y_top: float, w: float, h: float, fill: bool, stroke: bool):
-        # PDF re usa canto inferior esquerdo, então convertemos
         y0 = y_top - h
         cmds.append(f"{x:.2f} {y0:.2f} {w:.2f} {h:.2f} re")
         if fill and stroke:
@@ -328,87 +307,125 @@ def build_weekly_report_pdf_bytes(
         cmds.append(f"({_pdf_escape(s)}) Tj")
         cmds.append("ET")
 
-    # Header
-    set_fill_gray(0.0)
-    text("F1", 16, margin_x, y, "Relatório Semanal")
-    text("F2", 9, margin_x, y - 18, f"Período: {period_label}")
-    text("F2", 9, margin_x, y - 32, f"Gerado em: {generated_at}")
-    text("F2", 9, W - margin_x - 180, y, store_name)
-    y -= 52
+    # background
+    set_fill_rgb(246, 248, 252)
+    set_stroke_rgb(246, 248, 252)
+    rect(0, H, W, H, fill=True, stroke=True)
 
-    # KPI cards
-    card_h = 54
-    gap = 10
-    card_w = (W - margin_x * 2 - gap * 2) / 3
+    # top panel
+    top_h = 88
+    set_fill_rgb(255, 255, 255)
+    set_stroke_rgb(230, 233, 240)
+    rect(0, H, W, top_h, fill=True, stroke=True)
 
-    def kpi_card(ix: int, title_: str, value_: str, y_top: float):
+    # neon lines
+    set_stroke_rgb(124, 77, 255)  # purple
+    cmds.append("2 w")
+    line(0, H - top_h + 14, W, H - top_h + 14)
+    set_stroke_rgb(0, 229, 255)   # cyan
+    cmds.append("1 w")
+    line(0, H - top_h + 12, W, H - top_h + 12)
+    cmds.append("1 w")
+
+    # header text
+    set_fill_rgb(20, 24, 33)
+    text("F1", 16, margin_x, H - 36, "Relatorio Mensal")
+    set_fill_rgb(90, 97, 110)
+    text("F2", 10, margin_x, H - 58, store_name)
+
+    set_fill_rgb(90, 97, 110)
+    text("F2", 9, W - margin_x - 240, H - 42, f"Periodo: {period_label}")
+    text("F2", 9, W - margin_x - 240, H - 60, f"Gerado em: {generated_at}")
+
+    # KPI cards (4)
+    y = H - top_h - 24
+    card_h = 58
+    gap = 12
+    card_w = (W - margin_x * 2 - gap * 3) / 4
+
+    def kpi_card(ix: int, title_: str, value_: str):
         x = margin_x + ix * (card_w + gap)
-        set_fill_gray(0.97)
-        set_stroke_gray(0.85)
-        rect(x, y_top, card_w, card_h, fill=True, stroke=True)
-        set_fill_gray(0.15)
-        text("F2", 9, x + 12, y_top - 18, title_)
-        set_fill_gray(0.0)
-        text("F1", 12, x + 12, y_top - 38, value_)
 
-    # primeira linha de KPIs (3)
-    row1 = kpis[:3]
-    row2 = kpis[3:6]
+        set_fill_rgb(255, 255, 255)
+        set_stroke_rgb(224, 228, 238)
+        rect(x, y, card_w, card_h, fill=True, stroke=True)
 
-    for i, (t, v) in enumerate(row1):
-        kpi_card(i, t, v, y)
-    y -= (card_h + 14)
+        set_fill_rgb(240, 241, 255)
+        set_stroke_rgb(240, 241, 255)
+        rect(x, y, card_w, 10, fill=True, stroke=True)
 
-    for i, (t, v) in enumerate(row2):
-        kpi_card(i, t, v, y)
-    y -= (card_h + 18)
+        set_stroke_rgb(124, 77, 255)
+        cmds.append("1.2 w")
+        line(x, y - 10 + 1, x + card_w, y - 10 + 1)
+        cmds.append("1 w")
 
-    # Seções
-    def section_title(title_: str):
-        nonlocal y
-        set_fill_gray(0.0)
-        text("F1", 10, margin_x, y, title_)
-        set_stroke_gray(0.85)
-        line(margin_x, y - 6, W - margin_x, y - 6)
-        y -= 24
+        set_fill_rgb(94, 101, 115)
+        text("F2", 8, x + 10, y - 22, title_)
+        set_fill_rgb(20, 24, 33)
+        text("F1", 12, x + 10, y - 44, value_)
 
-    def kv_table(items: list[tuple[str, str]]):
-        nonlocal y
+    for i, (t, v) in enumerate(kpis[:4]):
+        kpi_card(i, t, v)
+
+    # sections (2 columns)
+    y2_top = y - 92
+    col_gap = 14
+    col_w = (W - margin_x * 2 - col_gap) / 2
+    left_x = margin_x
+    right_x = margin_x + col_w + col_gap
+    box_h = 300
+
+    def section_box(x: float, y_top: float, title_: str, items: list[tuple[str, str]], accent_rgb: tuple[int, int, int]):
+        ar, ag, ab = accent_rgb
+
+        set_fill_rgb(255, 255, 255)
+        set_stroke_rgb(224, 228, 238)
+        rect(x, y_top, col_w, box_h, fill=True, stroke=True)
+
+        set_fill_rgb(246, 248, 252)
+        set_stroke_rgb(246, 248, 252)
+        rect(x, y_top, col_w, 34, fill=True, stroke=True)
+
+        set_fill_rgb(ar, ag, ab)
+        set_stroke_rgb(ar, ag, ab)
+        rect(x + 12, y_top - 10, 8, 8, fill=True, stroke=True)
+
+        set_stroke_rgb(ar, ag, ab)
+        cmds.append("1.2 w")
+        line(x + 24, y_top - 14, x + col_w - 12, y_top - 14)
+        cmds.append("1 w")
+
+        set_fill_rgb(20, 24, 33)
+        text("F1", 11, x + 12, y_top - 24, title_)
+
+        yy = y_top - 54
         for k, v in items:
-            if y < 80:
-                # sem paginação para manter simples; se precisar, dá pra implementar
+            if yy < y_top - box_h + 24:
                 break
-            set_fill_gray(0.35)
-            text("F2", 9, margin_x, y, f"{k}")
-            set_fill_gray(0.0)
-            text("F2", 9, W - margin_x - 220, y, f"{v}")
-            y -= 16
-        y -= 8
+            set_fill_rgb(95, 103, 118)
+            text("F2", 9, x + 12, yy, k)
+            set_fill_rgb(20, 24, 33)
+            text("F2", 9, x + col_w - 170, yy, v)
+            yy -= 18
 
-    for title_, items in sections:
-        section_title(title_)
-        kv_table(items)
+    section_box(left_x, y2_top, "Vendas por pagamento (liquido)", payments, (0, 229, 255))
+    section_box(right_x, y2_top, "Financeiro", finance, (124, 77, 255))
 
-    # Footer
-    set_fill_gray(0.45)
+    # footer
+    set_fill_rgb(120, 128, 144)
+    if footnote:
+        text("F2", 8, margin_x, 46, footnote[:140])
     text("F2", 8, margin_x, 28, "Gerado automaticamente pelo WI Motos.")
-    text("F2", 8, W - margin_x - 60, 28, "Página 1/1")
+    text("F2", 8, W - margin_x - 70, 28, "Pagina 1/1")
 
     content = "\n".join(cmds).encode("utf-8")
 
-    # --- monta PDF básico ---
     def obj(n: int, body: bytes) -> bytes:
         return f"{n} 0 obj\n".encode() + body + b"\nendobj\n"
 
     objects: list[bytes] = []
-
-    # 1) Catalog
     objects.append(obj(1, b"<< /Type /Catalog /Pages 2 0 R >>"))
-
-    # 2) Pages
     objects.append(obj(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"))
-
-    # 3) Page
     page = (
         b"<< /Type /Page /Parent 2 0 R "
         b"/MediaBox [0 0 595 842] "
@@ -416,20 +433,13 @@ def build_weekly_report_pdf_bytes(
         b"/Contents 6 0 R >>"
     )
     objects.append(obj(3, page))
-
-    # 4) Font bold
     objects.append(obj(4, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>"))
-    # 5) Font regular
     objects.append(obj(5, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"))
-
-    # 6) Content stream
     stream = b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream"
     objects.append(obj(6, stream))
 
-    # xref
     pdf = io.BytesIO()
     pdf.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
-
     offsets = [0]
     for o in objects:
         offsets.append(pdf.tell())
@@ -450,12 +460,39 @@ def build_weekly_report_pdf_bytes(
             "%%EOF\n"
         ).encode("utf-8")
     )
-
     return pdf.getvalue()
 
 
 # ============================================================
-# ✅ RELATÓRIO SEMANAL (PDF base64 via /send/media document)
+# ✅ REPORTS: state helpers
+# ============================================================
+
+def _read_text_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+def _write_text_file(path: Path, value: str) -> None:
+    path.write_text((value or "").strip(), encoding="utf-8")
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_json(path: Path, data: dict[str, Any]) -> None:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ============================================================
+# ✅ RELATORIO SEMANAL: agora vai por MENSAGEM (texto)
 # ============================================================
 
 def week_start_end_local(today: date) -> tuple[date, date]:
@@ -469,16 +506,14 @@ def weekly_label(start: date, end: date) -> str:
 
 
 def weekly_already_sent(label: str) -> bool:
-    if not WEEKLY_REPORT_SENT_FILE.exists():
-        return False
-    return WEEKLY_REPORT_SENT_FILE.read_text(encoding="utf-8").strip() == label
+    return _read_text_file(WEEKLY_REPORT_SENT_FILE) == label
 
 
 def weekly_mark_sent(label: str) -> None:
-    WEEKLY_REPORT_SENT_FILE.write_text(label, encoding="utf-8")
+    _write_text_file(WEEKLY_REPORT_SENT_FILE, label)
 
 
-def process_weekly_report(db: Session, to_number: str) -> int:
+def process_weekly_report_text(db: Session, to_number: str) -> int:
     enabled = (os.getenv("WEEKLY_REPORT_ENABLED", "1").strip().lower() in ("1", "true", "yes"))
     if not enabled:
         return 0
@@ -495,7 +530,6 @@ def process_weekly_report(db: Session, to_number: str) -> int:
 
     today = today_local_date()
     start_d, end_d = week_start_end_local(today)
-
     label = weekly_label(start_d, end_d)
     if weekly_already_sent(label):
         return 0
@@ -554,50 +588,6 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     pt_fin = getattr(PaymentType, "FINANCING", None)
     financing_total = sum_by_payment(pt_fin) if pt_fin else Decimal("0")
 
-    q_sales_canceled = (
-        select(func.count(SaleORM.id))
-        .where(
-            and_(
-                SaleORM.status == SaleStatus.CANCELED,
-                SaleORM.created_at >= start_dt,
-                SaleORM.created_at < end_dt,
-            )
-        )
-    )
-    sales_canceled_count = int(db.execute(q_sales_canceled).scalar() or 0)
-
-    q_inst_paid = (
-        select(
-            func.count(InstallmentORM.id),
-            func.coalesce(func.sum(InstallmentORM.paid_amount), 0),
-            func.coalesce(func.sum(InstallmentORM.amount), 0),
-        )
-        .where(
-            and_(
-                InstallmentORM.status == InstallmentStatus.PAID,
-                InstallmentORM.paid_at.is_not(None),
-                InstallmentORM.paid_at >= start_dt,
-                InstallmentORM.paid_at < end_dt,
-            )
-        )
-    )
-    ic, inst_paid_amount_sum, inst_nominal_sum = db.execute(q_inst_paid).one()
-    installments_paid_count = int(ic or 0)
-    installments_paid_amount = Decimal(str(inst_paid_amount_sum or "0"))
-    installments_nominal = Decimal(str(inst_nominal_sum or "0"))
-    received_installments = installments_paid_amount if installments_paid_amount > 0 else installments_nominal
-
-    q_fin_created = (
-        select(
-            func.count(FinanceORM.id),
-            func.coalesce(func.sum(FinanceORM.amount), 0),
-        )
-        .where(and_(FinanceORM.created_at >= start_dt, FinanceORM.created_at < end_dt))
-    )
-    fc, fin_created_sum = db.execute(q_fin_created).one()
-    finance_created_count = int(fc or 0)
-    finance_created_total = Decimal(str(fin_created_sum or "0"))
-
     def fin_sum_status(st: FinanceStatus) -> Decimal:
         q = select(func.coalesce(func.sum(FinanceORM.amount), 0)).where(FinanceORM.status == st)
         v = db.execute(q).scalar()
@@ -605,86 +595,380 @@ def process_weekly_report(db: Session, to_number: str) -> int:
 
     fin_pending_total = fin_sum_status(FinanceStatus.PENDING)
     fin_paid_total = fin_sum_status(FinanceStatus.PAID)
-    fin_canceled_total = fin_sum_status(FinanceStatus.CANCELED)
 
     period = f"{start_d.strftime('%d/%m')} a {end_d.strftime('%d/%m')}"
+
+    msg = (
+        f"📊 *RELATORIO SEMANAL*\n"
+        f"Periodo: {period}\n\n"
+        f"Vendas confirmadas: *{sales_confirmed_count}*\n"
+        f"Liquido vendido: *{format_brl(sales_net)}*\n"
+        f"Entradas: {format_brl(sales_entry)}\n"
+        f"Lucro estimado: {format_brl(profit_estimated)}\n\n"
+        f"*Pagamentos (liquido)*\n"
+        f"Dinheiro: {format_brl(cash_total)}\n"
+        f"Pix: {format_brl(pix_total)}\n"
+        f"Cartao: {format_brl(card_total)}\n"
+        f"Promissoria: {format_brl(prom_total)}\n"
+        + (f"Financiamento: {format_brl(financing_total)}\n" if pt_fin else "")
+        + "\n"
+        f"*Financeiro (atual)*\n"
+        f"Pendente: {format_brl(fin_pending_total)}\n"
+        f"Pago: {format_brl(fin_paid_total)}\n"
+    )
+
+    try:
+        send_whatsapp_text(to=to_number, body=msg)
+        weekly_mark_sent(label)
+        return 1
+    except UazapiError as e:
+        print(f"[worker] weekly_report_text FAILED: {e}")
+        return 0
+
+
+# ============================================================
+# ✅ RELATORIO MENSAL: PDF no ultimo dia do mes
+# ============================================================
+
+def monthly_label(year: int, month: int) -> str:
+    return f"{year:04d}-{month:02d}"
+
+
+def monthly_already_sent(label: str) -> bool:
+    return _read_text_file(MONTHLY_REPORT_SENT_FILE) == label
+
+
+def monthly_mark_sent(label: str) -> None:
+    _write_text_file(MONTHLY_REPORT_SENT_FILE, label)
+
+
+def month_start_end(d: date) -> tuple[date, date]:
+    start = d.replace(day=1)
+    # last day = day before next month first day
+    if start.month == 12:
+        nxt = date(start.year + 1, 1, 1)
+    else:
+        nxt = date(start.year, start.month + 1, 1)
+    end = nxt - timedelta(days=1)
+    return start, end
+
+
+def process_monthly_report_pdf(db: Session, to_number: str) -> int:
+    enabled = (os.getenv("MONTHLY_REPORT_ENABLED", "1").strip().lower() in ("1", "true", "yes"))
+    if not enabled:
+        return 0
+
+    hour = int(os.getenv("MONTHLY_REPORT_HOUR", "20"))
+    minute = int(os.getenv("MONTHLY_REPORT_MINUTE", "0"))
+
+    today = today_local_date()
+    if not is_last_day_of_month(today):
+        return 0
+
+    now_local = datetime.now()
+    if (now_local.hour, now_local.minute) < (hour, minute):
+        return 0
+
+    label = monthly_label(today.year, today.month)
+    if monthly_already_sent(label):
+        return 0
+
+    start_d, end_d = month_start_end(today)
+    start_dt = datetime.combine(start_d, datetime.min.time())
+    end_dt = datetime.combine(end_d + timedelta(days=1), datetime.min.time())  # exclusivo
+
+    q_sales = (
+        select(
+            func.count(SaleORM.id),
+            func.coalesce(func.sum(SaleORM.total), 0),
+            func.coalesce(func.sum(SaleORM.discount), 0),
+            func.coalesce(func.sum(SaleORM.entry_amount), 0),
+            func.coalesce(
+                func.sum((SaleORM.total - SaleORM.discount) - func.coalesce(SaleORM.product_cost_price, 0)),
+                0,
+            ),
+        )
+        .where(
+            and_(
+                SaleORM.status == SaleStatus.CONFIRMED,
+                SaleORM.created_at >= start_dt,
+                SaleORM.created_at < end_dt,
+            )
+        )
+    )
+    sc, s_total, s_discount, s_entry, s_profit = db.execute(q_sales).one()
+
+    sales_confirmed_count = int(sc or 0)
+    sales_total = Decimal(str(s_total or "0"))
+    sales_discount = Decimal(str(s_discount or "0"))
+    sales_entry = Decimal(str(s_entry or "0"))
+    sales_net = (sales_total - sales_discount).quantize(Decimal("0.01"))
+    profit_estimated = Decimal(str(s_profit or "0")).quantize(Decimal("0.01"))
+
+    def sum_by_payment(pt: PaymentType) -> Decimal:
+        q = (
+            select(func.coalesce(func.sum(SaleORM.total - SaleORM.discount), 0))
+            .where(
+                and_(
+                    SaleORM.status == SaleStatus.CONFIRMED,
+                    SaleORM.payment_type == pt,
+                    SaleORM.created_at >= start_dt,
+                    SaleORM.created_at < end_dt,
+                )
+            )
+        )
+        v = db.execute(q).scalar()
+        return Decimal(str(v or "0"))
+
+    cash_total = sum_by_payment(PaymentType.CASH)
+    pix_total = sum_by_payment(PaymentType.PIX)
+    card_total = sum_by_payment(PaymentType.CARD)
+    prom_total = sum_by_payment(PaymentType.PROMISSORY)
+
+    pt_fin = getattr(PaymentType, "FINANCING", None)
+    financing_total = sum_by_payment(pt_fin) if pt_fin else Decimal("0")
+
+    # Finance status (current)
+    def fin_sum_status(st: FinanceStatus) -> Decimal:
+        q = select(func.coalesce(func.sum(FinanceORM.amount), 0)).where(FinanceORM.status == st)
+        v = db.execute(q).scalar()
+        return Decimal(str(v or "0"))
+
+    fin_pending = fin_sum_status(FinanceStatus.PENDING)
+    fin_paid = fin_sum_status(FinanceStatus.PAID)
+    fin_canceled = fin_sum_status(FinanceStatus.CANCELED)
+
+    # Finance created in month
+    q_fin_created = (
+        select(func.coalesce(func.sum(FinanceORM.amount), 0))
+        .where(and_(FinanceORM.created_at >= start_dt, FinanceORM.created_at < end_dt))
+    )
+    fin_created_month = Decimal(str(db.execute(q_fin_created).scalar() or "0"))
+
     store_name = (os.getenv("PDF_STORE_NAME") or "Wesley Motos").strip()
+    period = f"{start_d.strftime('%d/%m/%Y')} a {end_d.strftime('%d/%m/%Y')}"
     generated_at = datetime.now().strftime("%d/%m/%Y %H:%M")
 
     kpis = [
         ("Vendas confirmadas", str(sales_confirmed_count)),
-        ("Líquido vendido", format_brl(sales_net)),
+        ("Liquido vendido", format_brl(sales_net)),
         ("Lucro estimado", format_brl(profit_estimated)),
         ("Entradas", format_brl(sales_entry)),
-        ("Recebimentos (parcelas)", format_brl(received_installments)),
-        ("Financeiro pendente", format_brl(fin_pending_total)),
     ]
 
-    sections: list[tuple[str, list[tuple[str, str]]]] = [
-        ("Vendas", [
-            ("Quantidade", str(sales_confirmed_count)),
-            ("Bruto", format_brl(sales_total)),
-            ("Descontos", format_brl(sales_discount)),
-            ("Líquido (bruto - desconto)", format_brl(sales_net)),
-            ("Entradas", format_brl(sales_entry)),
-            ("Lucro estimado", format_brl(profit_estimated)),
-            ("Canceladas", str(sales_canceled_count)),
-        ]),
-        ("Por forma de pagamento (vendas - líquido)", [
-            ("Dinheiro", format_brl(cash_total)),
-            ("Pix", format_brl(pix_total)),
-            ("Cartão", format_brl(card_total)),
-            ("Promissória", format_brl(prom_total)),
-        ] + ([("Financiamento", format_brl(financing_total))] if pt_fin else [])),
-        ("Parcelas", [
-            ("Parcelas pagas (qtd)", str(installments_paid_count)),
-            ("Total recebido", format_brl(received_installments)),
-        ]),
-        ("Financeiro", [
-            ("Contas criadas na semana (qtd)", str(finance_created_count)),
-            ("Total criado na semana", format_brl(finance_created_total)),
-            ("Pendente (atual)", format_brl(fin_pending_total)),
-            ("Pago (atual)", format_brl(fin_paid_total)),
-            ("Cancelado (atual)", format_brl(fin_canceled_total)),
-        ]),
+    payments = [
+        ("Dinheiro", format_brl(cash_total)),
+        ("Pix", format_brl(pix_total)),
+        ("Cartao", format_brl(card_total)),
+        ("Promissoria", format_brl(prom_total)),
+    ] + ([("Financiamento", format_brl(financing_total))] if pt_fin else [])
+
+    finance = [
+        ("Criado no mes", format_brl(fin_created_month)),
+        ("Pendente", format_brl(fin_pending)),
+        ("Pago", format_brl(fin_paid)),
+        ("Cancelado", format_brl(fin_canceled)),
     ]
 
     try:
-        pdf_bytes = build_weekly_report_pdf_bytes(
+        pdf_bytes = build_futuristic_light_pdf_bytes(
             store_name=store_name,
             period_label=period,
             generated_at=generated_at,
             kpis=kpis,
-            sections=sections,
+            payments=payments,
+            finance=finance,
+            footnote="Fechamento do mes. Valores em BRL.",
         )
 
         b64 = base64.b64encode(pdf_bytes).decode("utf-8")
         pdf_data_uri = f"data:application/pdf;base64,{b64}"
-
-        filename = f"Relatorio_Semanal_{start_d.strftime('%Y-%m-%d')}_a_{end_d.strftime('%Y-%m-%d')}.pdf"
+        filename = f"Relatorio_Mensal_{label}.pdf"
 
         send_whatsapp_media(
             to=to_number,
             type_="document",
             file_url=pdf_data_uri,
-            text=f"📊 Relatório semanal ({period})",
+            text=f"📄 Relatorio mensal ({label})",
             doc_name=filename,
             mime_type="application/pdf",
         )
 
-        weekly_mark_sent(label)
+        monthly_mark_sent(label)
         return 1
 
     except UazapiError as e:
-        print(f"[worker] weekly_report FAILED: {e}")
+        print(f"[worker] monthly_report_pdf FAILED: {e}")
         return 0
     except Exception as e:
-        print(f"[worker] weekly_report FAILED (pdf): {e}")
+        print(f"[worker] monthly_report_pdf FAILED (pdf): {e}")
         return 0
 
 
 # ============================================================
-# PROCESSOS EXISTENTES
+# ✅ ALERTA: para cada venda CONFIRMADA -> WhatsApp em ALERT_TO
+# ============================================================
+
+def _get_alert_to() -> str:
+    # ALERT_TO no formato do uazapi: "5583..."
+    return (os.getenv("ALERT_TO") or "").strip()
+
+
+def _load_sales_alert_state() -> dict[str, Any]:
+    st = _load_json(SALES_ALERT_STATE_FILE)
+    if not isinstance(st, dict):
+        st = {}
+    if "max_id" not in st:
+        st["max_id"] = 0
+    if "last_run_utc" not in st:
+        st["last_run_utc"] = None
+    return st
+
+
+def _save_sales_alert_state(st: dict[str, Any]) -> None:
+    _save_json(SALES_ALERT_STATE_FILE, st)
+
+
+def _iso(dt: datetime) -> str:
+    return dt.isoformat()
+
+
+def _parse_iso(s: Any) -> Optional[datetime]:
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def process_confirmed_sales_alerts(db: Session) -> int:
+    alert_to = _get_alert_to()
+    if not alert_to:
+        return 0
+
+    enabled = (os.getenv("SALE_CONFIRMED_ALERTS_ENABLED", "1").strip().lower() in ("1", "true", "yes"))
+    if not enabled:
+        return 0
+
+    st = _load_sales_alert_state()
+    max_id = int(st.get("max_id", 0) or 0)
+    last_run = _parse_iso(st.get("last_run_utc"))
+
+    # Tenta detectar o melhor campo de "momento da confirmacao"
+    has_confirmed_at = hasattr(SaleORM, "confirmed_at")
+    has_updated_at = hasattr(SaleORM, "updated_at")
+
+    stmt = (
+        select(SaleORM)
+        .options(
+            # se existirem relações, isso ajuda; se não existirem, não quebra.
+            selectinload(getattr(SaleORM, "client", None)) if hasattr(SaleORM, "client") else (),
+            selectinload(getattr(SaleORM, "product", None)) if hasattr(SaleORM, "product") else (),
+        )
+        .where(SaleORM.status == SaleStatus.CONFIRMED)
+        .order_by(SaleORM.id.asc())
+        .limit(200)
+    )
+
+    if has_confirmed_at and last_run:
+        stmt = stmt.where(getattr(SaleORM, "confirmed_at") >= last_run)
+    elif has_updated_at and last_run:
+        stmt = stmt.where(getattr(SaleORM, "updated_at") >= last_run)
+    else:
+        # fallback: somente por id crescente
+        stmt = stmt.where(SaleORM.id > max_id)
+
+    rows = db.execute(stmt).scalars().all()
+    if not rows:
+        st["last_run_utc"] = _iso(now_utc())
+        _save_sales_alert_state(st)
+        return 0
+
+    sent = 0
+    new_max = max_id
+
+    for s in rows:
+        try:
+            sale_id = int(getattr(s, "id", 0) or 0)
+            if sale_id > new_max:
+                new_max = sale_id
+
+            total = getattr(s, "total", None)
+            discount = getattr(s, "discount", None)
+            entry = getattr(s, "entry_amount", None)
+            payment_type = getattr(s, "payment_type", None)
+            created_at = getattr(s, "created_at", None)
+
+            # client/product (best-effort)
+            client_name = "-"
+            client_phone = "-"
+            if hasattr(s, "client") and getattr(s, "client", None) is not None:
+                c = getattr(s, "client")
+                client_name = (getattr(c, "name", None) or "-")
+                client_phone = format_br_phone(getattr(c, "phone", None) or "")
+            else:
+                # tenta client_id
+                cid = getattr(s, "client_id", None)
+                if cid:
+                    client_name = f"Cliente #{cid}"
+
+            product_label = "-"
+            if hasattr(s, "product") and getattr(s, "product", None) is not None:
+                p = getattr(s, "product")
+                brand = getattr(p, "brand", "") or ""
+                model = getattr(p, "model", "") or ""
+                year = getattr(p, "year", "") or ""
+                plate = getattr(p, "plate", None) or ""
+                product_label = f"{brand} {model} ({year})" + (f" • {plate}" if plate else "")
+            else:
+                pid = getattr(s, "product_id", None)
+                if pid:
+                    product_label = f"Produto #{pid}"
+
+            liquid = None
+            try:
+                liquid = (Decimal(str(total or "0")) - Decimal(str(discount or "0"))).quantize(Decimal("0.01"))
+            except Exception:
+                liquid = None
+
+            created_str = "-"
+            if isinstance(created_at, datetime):
+                created_str = created_at.strftime("%d/%m/%Y %H:%M")
+
+            pt_str = str(payment_type.value if hasattr(payment_type, "value") else payment_type or "-")
+
+            msg = (
+                "✅ *VENDA CONFIRMADA*\n"
+                f"ID: {sale_id}\n"
+                f"Cliente: {client_name}\n"
+                f"Telefone: {client_phone}\n"
+                f"Produto: {product_label}\n"
+                f"Pagamento: {pt_str}\n"
+                f"Total: {format_brl(total)}\n"
+                f"Desconto: {format_brl(discount)}\n"
+                f"Liquido: {format_brl(liquid)}\n"
+                f"Entrada: {format_brl(entry)}\n"
+                f"Data: {created_str}"
+            )
+
+            send_whatsapp_text(to=alert_to, body=msg)
+            sent += 1
+
+        except UazapiError as e:
+            print(f"[worker] sale_confirmed_alert FAILED sale_id={getattr(s,'id',None)}: {e}")
+        except Exception as e:
+            print(f"[worker] sale_confirmed_alert ERROR sale_id={getattr(s,'id',None)}: {e}")
+
+    st["max_id"] = int(new_max)
+    st["last_run_utc"] = _iso(now_utc())
+    _save_sales_alert_state(st)
+
+    return sent
+
+
+# ============================================================
+# PROCESSOS EXISTENTES (iguais)
 # ============================================================
 
 def process_finance(db: Session, to_number: str) -> int:
@@ -1092,11 +1376,11 @@ def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
     p = chosen
     caption = (
         "🔥 *OFERTA DO DIA 🔥*\n"
-        f"🏍️ Modelo: {p.brand} {p.model}\n"
-        f"🎨 Cor: {p.color}\n"
-        f"📆 Ano: {p.year}\n"
-        f"🛣️ KM: {p.km}\n"
-        f"💰 Preço: *{format_brl(p.sale_price)}*\n"
+        f"Modelo: {p.brand} {p.model}\n"
+        f"Cor: {p.color}\n"
+        f"Ano: {p.year}\n"
+        f"KM: {p.km}\n"
+        f"Preco: *{format_brl(p.sale_price)}*\n"
     )
 
     try:
@@ -1125,7 +1409,7 @@ def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
 def run_loop() -> None:
     print("[worker] UAZAPI_DEFAULT_TO=", repr(os.getenv("UAZAPI_DEFAULT_TO")))
     print("[worker] UAZAPI_TOKEN exists?  ", bool((os.getenv("UAZAPI_TOKEN") or "").strip()))
-    print("[worker] BLIBSEND_DEFAULT_TO=", repr(os.getenv("BLIBSEND_DEFAULT_TO")))
+    print("[worker] ALERT_TO=", repr(os.getenv("ALERT_TO")))
 
     to_number = os.getenv("UAZAPI_DEFAULT_TO", "").strip()
     if not to_number:
@@ -1156,7 +1440,14 @@ def run_loop() -> None:
         started = time.time()
 
         with SessionLocal() as db:
-            a = b = c = d = e = wr = 0
+            a = b = c = d = e = wr = mr = sa = 0
+
+            # ✅ alertas de venda confirmada -> ALERT_TO
+            try:
+                sa = process_confirmed_sales_alerts(db)
+            except Exception as ex:
+                db.rollback()
+                print(f"[worker] ERROR process_confirmed_sales_alerts: {ex}")
 
             try:
                 a = process_finance(db, to_number)
@@ -1182,12 +1473,21 @@ def run_loop() -> None:
                 db.rollback()
                 print(f"[worker] ERROR process_installments_overdue: {ex}")
 
+            # ✅ semanal -> texto
             try:
-                wr = process_weekly_report(db, to_number)
+                wr = process_weekly_report_text(db, to_number)
             except Exception as ex:
                 db.rollback()
-                print(f"[worker] ERROR process_weekly_report: {ex}")
+                print(f"[worker] ERROR process_weekly_report_text: {ex}")
 
+            # ✅ mensal -> pdf (ultimo dia do mes)
+            try:
+                mr = process_monthly_report_pdf(db, to_number)
+            except Exception as ex:
+                db.rollback()
+                print(f"[worker] ERROR process_monthly_report_pdf: {ex}")
+
+            # ✅ ofertas (1/h, sem repetir produto no dia)
             try:
                 now_local_dt = datetime.now()
                 if offers_can_send_now(now_local_dt, start_hour=offers_start_hour, end_hour=offers_end_hour):
@@ -1201,10 +1501,11 @@ def run_loop() -> None:
                 db.rollback()
                 print(f"[worker] ERROR process_hourly_product_offer: {ex}")
 
-            if a or b or c or d or e or wr:
+            if a or b or c or d or e or wr or mr or sa:
                 print(
-                    f"[worker] sent finance={a} due_soon_installments={c} "
-                    f"due_today_client={e} overdue_installments={b} offers={d} weekly_report={wr}"
+                    f"[worker] sent sales_alerts={sa} finance={a} due_soon_installments={c} "
+                    f"due_today_client={e} overdue_installments={b} offers={d} "
+                    f"weekly_text={wr} monthly_pdf={mr}"
                 )
 
         elapsed = time.time() - started
