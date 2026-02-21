@@ -39,9 +39,8 @@ app = FastAPI(title="Moto Store API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS_LIST,
-    allow_origin_regex=os.getenv("CORS_ORIGIN_REGEX"),
-    allow_credentials=False,
+    allow_origins=ALLOW_ORIGINS_LIST + ["https://tauri.localhost"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -109,4 +108,5 @@ app.include_router(users_router, prefix="/users", tags=["users"])
 app.include_router(finance_router, prefix="/finance", tags=["finance"])
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(health_router, tags=["health"])
+
 
