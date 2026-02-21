@@ -61,12 +61,21 @@ def now_utc() -> datetime:
 
 
 def today_local_date() -> date:
-    # servidor em Fortaleza? se quiser forçar, use ZoneInfo.
     return datetime.now().date()
 
 
 def is_last_day_of_month(d: date) -> bool:
     return (d + timedelta(days=1)).month != d.month
+
+
+def month_start_end(d: date) -> tuple[date, date]:
+    start = d.replace(day=1)
+    if start.month == 12:
+        nxt = date(start.year + 1, 1, 1)
+    else:
+        nxt = date(start.year, start.month + 1, 1)
+    end = nxt - timedelta(days=1)
+    return start, end
 
 
 # ============================================================
@@ -464,7 +473,7 @@ def build_futuristic_light_pdf_bytes(
 
 
 # ============================================================
-# ✅ REPORTS: state helpers
+# STATE HELPERS
 # ============================================================
 
 def _read_text_file(path: Path) -> str:
@@ -491,8 +500,12 @@ def _save_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _iso(dt: datetime) -> str:
+    return dt.isoformat()
+
+
 # ============================================================
-# ✅ RELATORIO SEMANAL: agora vai por MENSAGEM (texto)
+# ✅ RELATORIO SEMANAL: texto (mensagem)
 # ============================================================
 
 def week_start_end_local(today: date) -> tuple[date, date]:
@@ -535,7 +548,7 @@ def process_weekly_report_text(db: Session, to_number: str) -> int:
         return 0
 
     start_dt = datetime.combine(start_d, datetime.min.time())
-    end_dt = datetime.combine(end_d + timedelta(days=1), datetime.min.time())  # exclusivo
+    end_dt = datetime.combine(end_d + timedelta(days=1), datetime.min.time())
 
     q_sales_confirmed = (
         select(
@@ -642,17 +655,6 @@ def monthly_mark_sent(label: str) -> None:
     _write_text_file(MONTHLY_REPORT_SENT_FILE, label)
 
 
-def month_start_end(d: date) -> tuple[date, date]:
-    start = d.replace(day=1)
-    # last day = day before next month first day
-    if start.month == 12:
-        nxt = date(start.year + 1, 1, 1)
-    else:
-        nxt = date(start.year, start.month + 1, 1)
-    end = nxt - timedelta(days=1)
-    return start, end
-
-
 def process_monthly_report_pdf(db: Session, to_number: str) -> int:
     enabled = (os.getenv("MONTHLY_REPORT_ENABLED", "1").strip().lower() in ("1", "true", "yes"))
     if not enabled:
@@ -675,7 +677,7 @@ def process_monthly_report_pdf(db: Session, to_number: str) -> int:
 
     start_d, end_d = month_start_end(today)
     start_dt = datetime.combine(start_d, datetime.min.time())
-    end_dt = datetime.combine(end_d + timedelta(days=1), datetime.min.time())  # exclusivo
+    end_dt = datetime.combine(end_d + timedelta(days=1), datetime.min.time())
 
     q_sales = (
         select(
@@ -728,7 +730,6 @@ def process_monthly_report_pdf(db: Session, to_number: str) -> int:
     pt_fin = getattr(PaymentType, "FINANCING", None)
     financing_total = sum_by_payment(pt_fin) if pt_fin else Decimal("0")
 
-    # Finance status (current)
     def fin_sum_status(st: FinanceStatus) -> Decimal:
         q = select(func.coalesce(func.sum(FinanceORM.amount), 0)).where(FinanceORM.status == st)
         v = db.execute(q).scalar()
@@ -738,7 +739,6 @@ def process_monthly_report_pdf(db: Session, to_number: str) -> int:
     fin_paid = fin_sum_status(FinanceStatus.PAID)
     fin_canceled = fin_sum_status(FinanceStatus.CANCELED)
 
-    # Finance created in month
     q_fin_created = (
         select(func.coalesce(func.sum(FinanceORM.amount), 0))
         .where(and_(FinanceORM.created_at >= start_dt, FinanceORM.created_at < end_dt))
@@ -806,11 +806,11 @@ def process_monthly_report_pdf(db: Session, to_number: str) -> int:
 
 
 # ============================================================
-# ✅ ALERTA: para cada venda CONFIRMADA -> WhatsApp em ALERT_TO
+# ✅ ALERTA: cada venda CONFIRMADA -> WhatsApp em ALERT_TO
+# (carrega client + product via relationship)
 # ============================================================
 
 def _get_alert_to() -> str:
-    # ALERT_TO no formato do uazapi: "5583..."
     return (os.getenv("ALERT_TO") or "").strip()
 
 
@@ -829,19 +829,6 @@ def _save_sales_alert_state(st: dict[str, Any]) -> None:
     _save_json(SALES_ALERT_STATE_FILE, st)
 
 
-def _iso(dt: datetime) -> str:
-    return dt.isoformat()
-
-
-def _parse_iso(s: Any) -> Optional[datetime]:
-    if not isinstance(s, str) or not s:
-        return None
-    try:
-        return datetime.fromisoformat(s)
-    except Exception:
-        return None
-
-
 def process_confirmed_sales_alerts(db: Session) -> int:
     alert_to = _get_alert_to()
     if not alert_to:
@@ -853,31 +840,18 @@ def process_confirmed_sales_alerts(db: Session) -> int:
 
     st = _load_sales_alert_state()
     max_id = int(st.get("max_id", 0) or 0)
-    last_run = _parse_iso(st.get("last_run_utc"))
-
-    # Tenta detectar o melhor campo de "momento da confirmacao"
-    has_confirmed_at = hasattr(SaleORM, "confirmed_at")
-    has_updated_at = hasattr(SaleORM, "updated_at")
 
     stmt = (
         select(SaleORM)
         .options(
-            # se existirem relações, isso ajuda; se não existirem, não quebra.
-            selectinload(getattr(SaleORM, "client", None)) if hasattr(SaleORM, "client") else (),
-            selectinload(getattr(SaleORM, "product", None)) if hasattr(SaleORM, "product") else (),
+            selectinload(SaleORM.client),
+            selectinload(SaleORM.product),
+            selectinload(SaleORM.user),
         )
-        .where(SaleORM.status == SaleStatus.CONFIRMED)
+        .where(and_(SaleORM.status == SaleStatus.CONFIRMED, SaleORM.id > max_id))
         .order_by(SaleORM.id.asc())
         .limit(200)
     )
-
-    if has_confirmed_at and last_run:
-        stmt = stmt.where(getattr(SaleORM, "confirmed_at") >= last_run)
-    elif has_updated_at and last_run:
-        stmt = stmt.where(getattr(SaleORM, "updated_at") >= last_run)
-    else:
-        # fallback: somente por id crescente
-        stmt = stmt.where(SaleORM.id > max_id)
 
     rows = db.execute(stmt).scalars().all()
     if not rows:
@@ -889,76 +863,74 @@ def process_confirmed_sales_alerts(db: Session) -> int:
     new_max = max_id
 
     for s in rows:
-        try:
-            sale_id = int(getattr(s, "id", 0) or 0)
-            if sale_id > new_max:
-                new_max = sale_id
+        sale_id = int(s.id or 0)
+        new_max = max(new_max, sale_id)
 
-            total = getattr(s, "total", None)
-            discount = getattr(s, "discount", None)
-            entry = getattr(s, "entry_amount", None)
-            payment_type = getattr(s, "payment_type", None)
-            created_at = getattr(s, "created_at", None)
+        # client
+        c = getattr(s, "client", None)
+        client_name = (getattr(c, "name", None) or f"Cliente #{getattr(s, 'client_id', '-')}")
+        client_phone = format_br_phone(getattr(c, "phone", None) or "")
 
-            # client/product (best-effort)
-            client_name = "-"
-            client_phone = "-"
-            if hasattr(s, "client") and getattr(s, "client", None) is not None:
-                c = getattr(s, "client")
-                client_name = (getattr(c, "name", None) or "-")
-                client_phone = format_br_phone(getattr(c, "phone", None) or "")
-            else:
-                # tenta client_id
-                cid = getattr(s, "client_id", None)
-                if cid:
-                    client_name = f"Cliente #{cid}"
-
-            product_label = "-"
-            if hasattr(s, "product") and getattr(s, "product", None) is not None:
-                p = getattr(s, "product")
-                brand = getattr(p, "brand", "") or ""
-                model = getattr(p, "model", "") or ""
-                year = getattr(p, "year", "") or ""
-                plate = getattr(p, "plate", None) or ""
+        # product with fallback snapshot on Sale
+        p = getattr(s, "product", None)
+        if p is not None:
+            brand = getattr(p, "brand", "") or ""
+            model = getattr(p, "model", "") or ""
+            year = getattr(p, "year", "") or ""
+            plate = getattr(p, "plate", None) or ""
+            product_label = f"{brand} {model} ({year})" + (f" • {plate}" if plate else "")
+        else:
+            brand = getattr(s, "product_brand", "") or ""
+            model = getattr(s, "product_model", "") or ""
+            year = getattr(s, "product_year", "") or ""
+            plate = getattr(s, "product_plate", None) or ""
+            if brand or model or year:
                 product_label = f"{brand} {model} ({year})" + (f" • {plate}" if plate else "")
             else:
-                pid = getattr(s, "product_id", None)
-                if pid:
-                    product_label = f"Produto #{pid}"
+                product_label = f"Produto #{getattr(s, 'product_id', '-')}"
+        
+        # seller/user (optional)
+        u = getattr(s, "user", None)
+        seller_name = (getattr(u, "name", None) or "-")
 
+        total = getattr(s, "total", None)
+        discount = getattr(s, "discount", None)
+        entry = getattr(s, "entry_amount", None)
+        payment_type = getattr(s, "payment_type", None)
+
+        # líquido
+        try:
+            liquid = (Decimal(str(total or "0")) - Decimal(str(discount or "0"))).quantize(Decimal("0.01"))
+        except Exception:
             liquid = None
-            try:
-                liquid = (Decimal(str(total or "0")) - Decimal(str(discount or "0"))).quantize(Decimal("0.01"))
-            except Exception:
-                liquid = None
 
-            created_str = "-"
-            if isinstance(created_at, datetime):
-                created_str = created_at.strftime("%d/%m/%Y %H:%M")
+        created_at = getattr(s, "created_at", None)
+        created_str = created_at.strftime("%d/%m/%Y %H:%M") if isinstance(created_at, datetime) else "-"
 
-            pt_str = str(payment_type.value if hasattr(payment_type, "value") else payment_type or "-")
+        pt_str = str(payment_type.value if hasattr(payment_type, "value") else payment_type or "-")
 
-            msg = (
-                "✅ *VENDA CONFIRMADA*\n"
-                f"ID: {sale_id}\n"
-                f"Cliente: {client_name}\n"
-                f"Telefone: {client_phone}\n"
-                f"Produto: {product_label}\n"
-                f"Pagamento: {pt_str}\n"
-                f"Total: {format_brl(total)}\n"
-                f"Desconto: {format_brl(discount)}\n"
-                f"Liquido: {format_brl(liquid)}\n"
-                f"Entrada: {format_brl(entry)}\n"
-                f"Data: {created_str}"
-            )
+        msg = (
+            "✅ *VENDA CONFIRMADA*\n"
+            f"ID: {sale_id}\n"
+            f"Vendedor: {seller_name}\n"
+            f"Cliente: {client_name}\n"
+            f"Telefone: {client_phone}\n"
+            f"Produto: {product_label}\n"
+            f"Pagamento: {pt_str}\n"
+            f"Total: {format_brl(total)}\n"
+            f"Desconto: {format_brl(discount)}\n"
+            f"Liquido: {format_brl(liquid)}\n"
+            f"Entrada: {format_brl(entry)}\n"
+            f"Data: {created_str}"
+        )
 
+        try:
             send_whatsapp_text(to=alert_to, body=msg)
             sent += 1
-
         except UazapiError as e:
-            print(f"[worker] sale_confirmed_alert FAILED sale_id={getattr(s,'id',None)}: {e}")
+            print(f"[worker] sale_confirmed_alert FAILED sale_id={sale_id}: {e}")
         except Exception as e:
-            print(f"[worker] sale_confirmed_alert ERROR sale_id={getattr(s,'id',None)}: {e}")
+            print(f"[worker] sale_confirmed_alert ERROR sale_id={sale_id}: {e}")
 
     st["max_id"] = int(new_max)
     st["last_run_utc"] = _iso(now_utc())
@@ -968,7 +940,7 @@ def process_confirmed_sales_alerts(db: Session) -> int:
 
 
 # ============================================================
-# PROCESSOS EXISTENTES (iguais)
+# PROCESSOS EXISTENTES (iguais ao seu)
 # ============================================================
 
 def process_finance(db: Session, to_number: str) -> int:
@@ -1043,7 +1015,9 @@ def process_installments_due_soon(db: Session, to_number: str) -> int:
         .options(
             selectinload(InstallmentORM.promissory).selectinload(PromissoryORM.client),
             selectinload(InstallmentORM.promissory).selectinload(PromissoryORM.product),
-            selectinload(InstallmentORM.promissory).selectinload(PromissoryORM.sale).selectinload(SaleORM.product),
+            selectinload(InstallmentORM.promissory)
+            .selectinload(PromissoryORM.sale)
+            .selectinload(SaleORM.product),
         )
         .where(
             and_(
@@ -1117,7 +1091,12 @@ def process_installments_due_soon(db: Session, to_number: str) -> int:
     return sent
 
 
-def process_installments_due_today_to_client(db: Session) -> int:
+def process_installments_due_today_to_client(db: Session, to_number: str) -> int:
+    """
+    ✅ ATENÇÃO: no seu código anterior esta função não recebia to_number,
+    mas aqui mantemos assinatura com to_number para consistência do loop.
+    (Ela envia pro CLIENTE, não pro dono.)
+    """
     enabled = os.getenv("DUE_TODAY_SEND_ENABLED", "1").strip() in ("1", "true", "True")
     if not enabled:
         return 0
@@ -1137,7 +1116,9 @@ def process_installments_due_today_to_client(db: Session) -> int:
         .options(
             selectinload(InstallmentORM.promissory).selectinload(PromissoryORM.client),
             selectinload(InstallmentORM.promissory).selectinload(PromissoryORM.product),
-            selectinload(InstallmentORM.promissory).selectinload(PromissoryORM.sale).selectinload(SaleORM.product),
+            selectinload(InstallmentORM.promissory)
+            .selectinload(PromissoryORM.sale)
+            .selectinload(SaleORM.product),
         )
         .where(
             and_(
@@ -1225,7 +1206,9 @@ def process_installments_overdue(db: Session, to_number: str) -> int:
         .options(
             selectinload(InstallmentORM.promissory).selectinload(PromissoryORM.client),
             selectinload(InstallmentORM.promissory).selectinload(PromissoryORM.product),
-            selectinload(InstallmentORM.promissory).selectinload(PromissoryORM.sale).selectinload(SaleORM.product),
+            selectinload(InstallmentORM.promissory)
+            .selectinload(PromissoryORM.sale)
+            .selectinload(SaleORM.product),
         )
         .where(
             and_(
@@ -1462,7 +1445,7 @@ def run_loop() -> None:
                 print(f"[worker] ERROR process_installments_due_soon: {ex}")
 
             try:
-                e = process_installments_due_today_to_client(db)
+                e = process_installments_due_today_to_client(db, to_number)
             except Exception as ex:
                 db.rollback()
                 print(f"[worker] ERROR process_installments_due_today_to_client: {ex}")
