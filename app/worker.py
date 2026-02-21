@@ -1,6 +1,8 @@
 # app/worker.py
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
 import time
@@ -13,6 +15,12 @@ from decimal import Decimal, ROUND_HALF_UP
 from dotenv import load_dotenv
 from sqlalchemy import and_, or_, select, func
 from sqlalchemy.orm import Session, selectinload
+
+# ✅ PDF (requirements.txt: reportlab>=4.0.0)
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib import colors
+from reportlab.pdfgen import canvas
 
 from app.infra.db import SessionLocal
 from app.infra.models import (
@@ -258,7 +266,156 @@ def _commit_row(db: Session, row) -> None:
 
 
 # ============================================================
-# ✅ RELATÓRIO SEMANAL (tolerante a FINANCING)
+# ✅ PDF (simples, profissional, sem poluição)
+# ============================================================
+
+def _pdf_draw_kpi_box(
+    c: canvas.Canvas,
+    *,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    title: str,
+    value: str,
+    subtitle: Optional[str] = None,
+) -> None:
+    c.setFillColor(colors.whitesmoke)
+    c.setStrokeColor(colors.lightgrey)
+    c.setLineWidth(0.8)
+    c.roundRect(x, y - h, w, h, 6, stroke=1, fill=1)
+
+    c.setFillColor(colors.black)
+    c.setFont("Helvetica", 9)
+    c.drawString(x + 10, y - 16, title)
+
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(x + 10, y - 34, value)
+
+    if subtitle:
+        c.setFont("Helvetica", 8)
+        c.setFillColor(colors.grey)
+        c.drawString(x + 10, y - 48, subtitle)
+        c.setFillColor(colors.black)
+
+
+def _pdf_draw_section_title(c: canvas.Canvas, x: float, y: float, text: str) -> None:
+    c.setFont("Helvetica-Bold", 10)
+    c.setFillColor(colors.black)
+    c.drawString(x, y, text)
+    c.setStrokeColor(colors.lightgrey)
+    c.setLineWidth(0.6)
+    c.line(x, y - 6, x + 180 * mm, y - 6)
+
+
+def _pdf_draw_kv_list(
+    c: canvas.Canvas,
+    *,
+    x: float,
+    y: float,
+    items: list[tuple[str, str]],
+    line_h: float = 14,
+) -> float:
+    c.setFont("Helvetica", 9)
+    yy = y
+    for k, v in items:
+        c.setFillColor(colors.grey)
+        c.drawString(x, yy, k)
+        c.setFillColor(colors.black)
+        c.drawRightString(x + 180 * mm, yy, v)
+        yy -= line_h
+    return yy
+
+
+def build_weekly_report_pdf_bytes(
+    *,
+    store_name: str,
+    period_label: str,
+    generated_at_local: str,
+    kpis: dict[str, str],
+    sales_block: list[tuple[str, str]],
+    payments_block: list[tuple[str, str]],
+    installments_block: list[tuple[str, str]],
+    finance_block: list[tuple[str, str]],
+) -> bytes:
+    """
+    PDF A4 com layout limpo:
+      - Cabeçalho + período
+      - KPIs em cards
+      - Seções em lista (chave/valor)
+    """
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    w, h = A4
+
+    margin_x = 18 * mm
+    y = h - 18 * mm
+
+    # Header
+    c.setFillColor(colors.black)
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(margin_x, y, "Relatório Semanal")
+    c.setFont("Helvetica", 9)
+    c.setFillColor(colors.grey)
+    c.drawRightString(w - margin_x, y, store_name)
+    y -= 16
+
+    c.setFillColor(colors.black)
+    c.setFont("Helvetica", 9)
+    c.drawString(margin_x, y, f"Período: {period_label}")
+    c.setFillColor(colors.grey)
+    c.drawRightString(w - margin_x, y, f"Gerado em: {generated_at_local}")
+    y -= 18
+
+    # KPI cards
+    card_h = 18 * mm
+    gap = 6 * mm
+    card_w = (w - margin_x * 2 - gap * 2) / 3
+
+    _pdf_draw_kpi_box(c, x=margin_x, y=y, w=card_w, h=card_h, title="Vendas confirmadas", value=kpis["sales_count"])
+    _pdf_draw_kpi_box(c, x=margin_x + card_w + gap, y=y, w=card_w, h=card_h, title="Líquido vendido", value=kpis["sales_net"])
+    _pdf_draw_kpi_box(c, x=margin_x + (card_w + gap) * 2, y=y, w=card_w, h=card_h, title="Lucro estimado", value=kpis["profit_est"])
+    y -= (card_h + 10)
+
+    _pdf_draw_kpi_box(c, x=margin_x, y=y, w=card_w, h=card_h, title="Entradas", value=kpis["sales_entry"])
+    _pdf_draw_kpi_box(c, x=margin_x + card_w + gap, y=y, w=card_w, h=card_h, title="Recebimentos (parcelas)", value=kpis["inst_received"])
+    _pdf_draw_kpi_box(c, x=margin_x + (card_w + gap) * 2, y=y, w=card_w, h=card_h, title="Financeiro pendente", value=kpis["fin_pending"])
+    y -= (card_h + 14)
+
+    # Sections
+    _pdf_draw_section_title(c, margin_x, y, "Vendas")
+    y -= 22
+    y = _pdf_draw_kv_list(c, x=margin_x, y=y, items=sales_block)
+    y -= 8
+
+    _pdf_draw_section_title(c, margin_x, y, "Por forma de pagamento (vendas - líquido)")
+    y -= 22
+    y = _pdf_draw_kv_list(c, x=margin_x, y=y, items=payments_block)
+    y -= 8
+
+    _pdf_draw_section_title(c, margin_x, y, "Parcelas")
+    y -= 22
+    y = _pdf_draw_kv_list(c, x=margin_x, y=y, items=installments_block)
+    y -= 8
+
+    _pdf_draw_section_title(c, margin_x, y, "Financeiro")
+    y -= 22
+    y = _pdf_draw_kv_list(c, x=margin_x, y=y, items=finance_block)
+    y -= 8
+
+    # Footer
+    c.setFont("Helvetica", 8)
+    c.setFillColor(colors.grey)
+    c.drawString(margin_x, 12 * mm, "Gerado automaticamente pelo WI Motos.")
+    c.drawRightString(w - margin_x, 12 * mm, "Página 1/1")
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+# ============================================================
+# ✅ RELATÓRIO SEMANAL (PDF via base64 /send/media document)
 # ============================================================
 
 def week_start_end_local(today: date) -> tuple[date, date]:
@@ -304,8 +461,11 @@ def process_weekly_report(db: Session, to_number: str) -> int:
         return 0
 
     start_dt = datetime.combine(start_d, datetime.min.time())
-    end_dt = datetime.combine(end_d + timedelta(days=1), datetime.min.time())
+    end_dt = datetime.combine(end_d + timedelta(days=1), datetime.min.time())  # exclusivo
 
+    # -------------------------
+    # VENDAS CONFIRMADAS
+    # -------------------------
     q_sales_confirmed = (
         select(
             func.count(SaleORM.id),
@@ -354,6 +514,7 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     card_total = sum_by_payment(PaymentType.CARD)
     prom_total = sum_by_payment(PaymentType.PROMISSORY)
 
+    # ✅ tolerante: se FINANCING não existir, fica 0
     pt_fin = getattr(PaymentType, "FINANCING", None)
     financing_total = sum_by_payment(pt_fin) if pt_fin else Decimal("0")
 
@@ -369,6 +530,9 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     )
     sales_canceled_count = int(db.execute(q_sales_canceled).scalar() or 0)
 
+    # -------------------------
+    # RECEBIMENTOS (PARCELAS PAGAS)
+    # -------------------------
     q_inst_paid = (
         select(
             func.count(InstallmentORM.id),
@@ -390,17 +554,15 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     installments_nominal = Decimal(str(inst_nominal_sum or "0"))
     received_installments = installments_paid_amount if installments_paid_amount > 0 else installments_nominal
 
+    # -------------------------
+    # FINANCEIRO (CRIADO NA SEMANA)
+    # -------------------------
     q_fin_created = (
         select(
             func.count(FinanceORM.id),
             func.coalesce(func.sum(FinanceORM.amount), 0),
         )
-        .where(
-            and_(
-                FinanceORM.created_at >= start_dt,
-                FinanceORM.created_at < end_dt,
-            )
-        )
+        .where(and_(FinanceORM.created_at >= start_dt, FinanceORM.created_at < end_dt))
     )
     fc, fin_created_sum = db.execute(q_fin_created).one()
     finance_created_count = int(fc or 0)
@@ -415,79 +577,88 @@ def process_weekly_report(db: Session, to_number: str) -> int:
     fin_paid_total = fin_sum_status(FinanceStatus.PAID)
     fin_canceled_total = fin_sum_status(FinanceStatus.CANCELED)
 
-    has_fin_payment_type = hasattr(FinanceORM, "payment_type")
-    fin_cash_week = fin_pix_week = fin_card_week = fin_prom_week = fin_financing_week = Decimal("0")
-
-    if has_fin_payment_type:
-        def fin_week_sum_by_payment(pt: PaymentType) -> Decimal:
-            q = (
-                select(func.coalesce(func.sum(FinanceORM.amount), 0))
-                .where(
-                    and_(
-                        FinanceORM.created_at >= start_dt,
-                        FinanceORM.created_at < end_dt,
-                        FinanceORM.payment_type == pt,
-                    )
-                )
-            )
-            v = db.execute(q).scalar()
-            return Decimal(str(v or "0"))
-
-        fin_cash_week = fin_week_sum_by_payment(PaymentType.CASH)
-        fin_pix_week = fin_week_sum_by_payment(PaymentType.PIX)
-        fin_card_week = fin_week_sum_by_payment(PaymentType.CARD)
-        fin_prom_week = fin_week_sum_by_payment(PaymentType.PROMISSORY)
-        fin_financing_week = fin_week_sum_by_payment(pt_fin) if pt_fin else Decimal("0")
-
+    # -------------------------
+    # PDF + envio
+    # -------------------------
     period = f"{start_d.strftime('%d/%m')} a {end_d.strftime('%d/%m')}"
+    store_name = (os.getenv("PDF_STORE_NAME") or "Wesley Motos").strip()
+    generated_at_local = datetime.now().strftime("%d/%m/%Y %H:%M")
 
-    finance_payment_block = ""
-    if has_fin_payment_type:
-        finance_payment_block = (
-            "• Por pagamento (criado na semana):\n"
-            f"   - Dinheiro: {format_brl(fin_cash_week)}\n"
-            f"   - Pix: {format_brl(fin_pix_week)}\n"
-            f"   - Cartão: {format_brl(fin_card_week)}\n"
-            f"   - Promissória: {format_brl(fin_prom_week)}\n"
-            + (f"   - Financiamento: {format_brl(fin_financing_week)}\n" if pt_fin else "")
-        )
+    kpis = {
+        "sales_count": str(sales_confirmed_count),
+        "sales_net": format_brl(sales_net),
+        "profit_est": format_brl(profit_estimated),
+        "sales_entry": format_brl(sales_entry),
+        "inst_received": format_brl(received_installments),
+        "fin_pending": format_brl(fin_pending_total),
+    }
 
-    msg = (
-        f"📊 *RELATÓRIO SEMANAL*\n"
-        f"🗓️ Período: {period}\n\n"
-        f"🏍️ *Vendas (CONFIRMADAS)*\n"
-        f"• Qtd: {sales_confirmed_count}\n"
-        f"• Bruto: {format_brl(sales_total)}\n"
-        f"• Descontos: {format_brl(sales_discount)}\n"
-        f"• Líquido (bruto-desconto): *{format_brl(sales_net)}*\n"
-        f"• Entradas: {format_brl(sales_entry)}\n"
-        f"• ✅ Lucro estimado: *{format_brl(profit_estimated)}*\n"
-        f"• Canceladas: {sales_canceled_count}\n\n"
-        f"💳 *Por pagamento (vendas - líquido)*\n"
-        f"• Dinheiro: {format_brl(cash_total)}\n"
-        f"• Pix: {format_brl(pix_total)}\n"
-        f"• Cartão: {format_brl(card_total)}\n"
-        f"• Promissória: {format_brl(prom_total)}\n"
-        + (f"• Financiamento: {format_brl(financing_total)}\n" if pt_fin else "") +
-        "\n"
-        f"✅ *Recebimentos (parcelas pagas)*\n"
-        f"• Qtd: {installments_paid_count}\n"
-        f"• Total recebido: *{format_brl(received_installments)}*\n\n"
-        f"🏦 *Financeiro*\n"
-        f"• Contas criadas na semana: {finance_created_count}\n"
-        f"• Total criado na semana: {format_brl(finance_created_total)}\n"
-        f"{finance_payment_block}"
-        f"• Pendente (atual): {format_brl(fin_pending_total)}\n"
-        f"• Pago (atual): {format_brl(fin_paid_total)}\n"
-        f"• Cancelado (atual): {format_brl(fin_canceled_total)}\n"
-    )
+    sales_block = [
+        ("Quantidade", str(sales_confirmed_count)),
+        ("Bruto", format_brl(sales_total)),
+        ("Descontos", format_brl(sales_discount)),
+        ("Líquido (bruto - desconto)", format_brl(sales_net)),
+        ("Entradas", format_brl(sales_entry)),
+        ("Lucro estimado", format_brl(profit_estimated)),
+        ("Canceladas", str(sales_canceled_count)),
+    ]
+
+    payments_block = [
+        ("Dinheiro", format_brl(cash_total)),
+        ("Pix", format_brl(pix_total)),
+        ("Cartão", format_brl(card_total)),
+        ("Promissória", format_brl(prom_total)),
+    ]
+    if pt_fin:
+        payments_block.append(("Financiamento", format_brl(financing_total)))
+
+    installments_block = [
+        ("Parcelas pagas (qtd)", str(installments_paid_count)),
+        ("Total recebido", format_brl(received_installments)),
+    ]
+
+    finance_block = [
+        ("Contas criadas na semana (qtd)", str(finance_created_count)),
+        ("Total criado na semana", format_brl(finance_created_total)),
+        ("Pendente (atual)", format_brl(fin_pending_total)),
+        ("Pago (atual)", format_brl(fin_paid_total)),
+        ("Cancelado (atual)", format_brl(fin_canceled_total)),
+    ]
 
     try:
-        send_whatsapp_text(to=to_number, body=msg)
+        pdf_bytes = build_weekly_report_pdf_bytes(
+            store_name=store_name,
+            period_label=period,
+            generated_at_local=generated_at_local,
+            kpis=kpis,
+            sales_block=sales_block,
+            payments_block=payments_block,
+            installments_block=installments_block,
+            finance_block=finance_block,
+        )
+
+        b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+        pdf_data_uri = f"data:application/pdf;base64,{b64}"
+
+        filename = f"Relatorio_Semanal_{start_d.strftime('%Y-%m-%d')}_a_{end_d.strftime('%Y-%m-%d')}.pdf"
+
+        send_whatsapp_media(
+            to=to_number,
+            type_="document",
+            file_url=pdf_data_uri,          # ✅ base64 (data-uri)
+            text=f"📊 Relatório semanal ({period})",
+            doc_name=filename,
+            mime_type="application/pdf",
+        )
+
         weekly_mark_sent(label)
         return 1
+
     except UazapiError as e:
         print(f"[worker] weekly_report FAILED: {e}")
+        return 0
+    except Exception as e:
+        print(f"[worker] weekly_report FAILED (pdf): {e}")
         return 0
 
 
@@ -863,7 +1034,6 @@ def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
     products = db.execute(stmt).scalars().all()
     print(f"[worker] offers(hourly): scanning {len(products)} IN_STOCK (query_limit={limit_query}, groups={len(group_ids)})")
 
-    # ✅ sent today set
     state = _load_offers_hourly_state()
     today = datetime.now().date().isoformat()
     sent_today = state.get("sent_product_ids") if state.get("date") == today else []
@@ -881,7 +1051,6 @@ def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
     chosen_cover_key: Optional[str] = None
 
     for p in products:
-        # ✅ não repetir
         if p.id in sent_today_set:
             continue
 
@@ -911,20 +1080,19 @@ def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
         f"🏍️ Modelo: {p.brand} {p.model}\n"
         f"🎨 Cor: {p.color}\n"
         f"📆 Ano: {p.year}\n"
-        f"🛣️ Kilometragem: {p.km}\n"
-        f"💰 *Preço: {format_brl(p.sale_price)}*\n"
+        f"🛣️ KM: {p.km}\n"
+        f"💰 Preço: *{format_brl(p.sale_price)}*\n"
     )
 
     try:
         image_url = resolve_image_to_public_url(chosen_cover_key)
 
-        # ✅ 1 mensagem (imagem + legenda)
         for group_to in group_ids:
             send_whatsapp_media(
                 to=group_to,
                 type_="image",
                 file_url=image_url,
-                text=caption,  # requer uazapi.py com suporte a 'text'
+                text=caption,
             )
 
         print(f"[worker] offers(hourly): SENT product_id={p.id} to_groups={len(group_ids)}")
