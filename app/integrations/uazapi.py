@@ -32,7 +32,7 @@ def _headers(cfg: UazapiConfig) -> dict[str, str]:
     return {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "token": cfg.token,  # Uazapi usa header token: ...
+        "token": cfg.token,
     }
 
 
@@ -54,14 +54,41 @@ def send_whatsapp_text(*, to: str, body: str) -> dict:
         raise UazapiError(f"UAZAPI send/text request error: {e}") from e
 
 
-def send_whatsapp_media(*, to: str, type_: str, file_url: str) -> dict:
+def send_whatsapp_media(
+    *,
+    to: str,
+    type_: str,
+    file_url: str,
+    text: Optional[str] = None,
+    doc_name: Optional[str] = None,
+    mime_type: Optional[str] = None,
+    thumbnail: Optional[str] = None,
+) -> dict:
     """
     POST /send/media
-    body: { "number": "...", "type": "image", "file": "https://..." }
+
+    body mínimo:
+      { "number": "...", "type": "image", "file": "https://..." }
+
+    extras suportados pela doc:
+      - text: legenda/caption (ex: imagem com legenda)
+      - docName: nome do arquivo (documents)
+      - mimetype: mime type opcional
+      - thumbnail: url/base64 para thumb (video/document)
     """
     cfg = _cfg()
     url = f"{cfg.base_url}/send/media"
-    payload = {"number": to, "type": type_, "file": file_url}
+
+    payload: dict = {"number": to, "type": type_, "file": file_url}
+
+    if text:
+        payload["text"] = text
+    if doc_name:
+        payload["docName"] = doc_name
+    if mime_type:
+        payload["mimetype"] = mime_type
+    if thumbnail:
+        payload["thumbnail"] = thumbnail
 
     try:
         r = requests.post(url, json=payload, headers=_headers(cfg), timeout=cfg.timeout)
