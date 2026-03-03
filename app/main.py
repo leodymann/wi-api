@@ -18,6 +18,7 @@ from app.api.routers.users import router as users_router
 from app.api.routers.finance import router as finance_router
 from app.api.routers.auth import router as auth_router
 from app.api.routers.health import router as health_router
+from app.api.routers.test import router as test_router
 
 from dotenv import load_dotenv
 
@@ -108,5 +109,7 @@ app.include_router(users_router, prefix="/users", tags=["users"])
 app.include_router(finance_router, prefix="/finance", tags=["finance"])
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(health_router, tags=["health"])
+app.include_router(test_router, tags=["test"])
+
 
 
