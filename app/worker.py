@@ -1363,7 +1363,7 @@ def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
         f"Cor: {p.color}\n"
         f"Ano: {p.year}\n"
         f"KM: {p.km}\n"
-        f"Preco: *{format_brl(p.sale_price)}*\n"
+        "💬 Chame no privado para mais informações\n"
     )
 
 try:
@@ -1517,4 +1517,5 @@ if __name__ == "__main__":
         run_loop()
     except KeyboardInterrupt:
         print("[worker] stopped (Ctrl+C)")
+
 
