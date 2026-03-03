@@ -1314,23 +1314,22 @@ def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
     )
 
     products = db.execute(stmt).scalars().all()
-    print(f"[worker] offers(hourly): scanning {len(products)} IN_STOCK (query_limit={limit_query}, groups={len(group_ids)})")
+    print(
+        f"[worker] offers(hourly): scanning {len(products)} "
+        f"IN_STOCK (query_limit={limit_query}, groups={len(group_ids)})"
+    )
 
     state = _load_offers_hourly_state()
     today = datetime.now().date().isoformat()
     sent_today = state.get("sent_product_ids") if state.get("date") == today else []
+
     if not isinstance(sent_today, list):
         sent_today = []
 
-    sent_today_set: set[int] = set()
-    for x in sent_today:
-        try:
-            sent_today_set.add(int(x))
-        except Exception:
-            pass
+    sent_today_set = set(int(x) for x in sent_today if str(x).isdigit())
 
-    chosen: Optional[ProductORM] = None
-    chosen_cover_key: Optional[str] = None
+    chosen = None
+    chosen_cover_key = None
 
     for p in products:
         if p.id in sent_today_set:
@@ -1350,13 +1349,11 @@ def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
         break
 
     if not chosen or not chosen_cover_key:
-        if sent_today_set:
-            print(f"[worker] offers(hourly): nenhum produto novo para hoje (já enviados: {len(sent_today_set)}).")
-        else:
-            print("[worker] offers(hourly): nenhum produto com imagem encontrado, não enviou.")
+        print("[worker] offers(hourly): nenhum produto elegível encontrado.")
         return 0
 
     p = chosen
+
     caption = (
         "🔥 *OFERTA DO DIA 🔥*\n"
         f"Modelo: {p.brand} {p.model}\n"
@@ -1366,7 +1363,7 @@ def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
         "💬 Chame no privado para mais informações\n"
     )
 
-try:
+    try:
         image_url = resolve_image_to_public_url(chosen_cover_key)
 
         success_count = 0
@@ -1386,20 +1383,17 @@ try:
                     f"product_id={p.id} group={group_to}: {group_error}"
                 )
 
-        if success_count > 0:
-            print(
-                f"[worker] offers(hourly): SENT product_id={p.id} "
-                f"success_groups={success_count}/{len(group_ids)}"
-            )
-            return int(p.id)
+        print(
+            f"[worker] offers(hourly): processed product_id={p.id} "
+            f"success_groups={success_count}/{len(group_ids)}"
+        )
 
-        print(f"[worker] offers(hourly): ALL GROUPS FAILED product_id={p.id}")
+        # Mesmo que falhe, marca como processado para evitar spam
         return int(p.id)
 
-    except (UazapiError, requests.RequestException, Exception) as e:
+    except Exception as e:
         print(f"[worker] offers(hourly): FAILED product_id={p.id}: {e}")
         return int(p.id)
-
 # ============================================================
 # LOOP
 # ============================================================
@@ -1516,6 +1510,7 @@ if __name__ == "__main__":
         run_loop()
     except KeyboardInterrupt:
         print("[worker] stopped (Ctrl+C)")
+
 
 
 
