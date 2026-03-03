@@ -1366,23 +1366,39 @@ def process_hourly_product_offer(db: Session, group_ids: List[str]) -> int:
         f"Preco: *{format_brl(p.sale_price)}*\n"
     )
 
-    try:
-        image_url = resolve_image_to_public_url(chosen_cover_key)
+try:
+    image_url = resolve_image_to_public_url(chosen_cover_key)
 
-        for group_to in group_ids:
+    success_count = 0
+
+    for group_to in group_ids:
+        try:
             send_whatsapp_media(
                 to=group_to,
                 type_="image",
                 file_url=image_url,
                 text=caption,
             )
+            success_count += 1
+        except Exception as group_error:
+            print(
+                f"[worker] offers(hourly): group FAILED "
+                f"product_id={p.id} group={group_to}: {group_error}"
+            )
 
-        print(f"[worker] offers(hourly): SENT product_id={p.id} to_groups={len(group_ids)}")
+    if success_count > 0:
+        print(
+            f"[worker] offers(hourly): SENT product_id={p.id} "
+            f"success_groups={success_count}/{len(group_ids)}"
+        )
         return int(p.id)
 
-    except (UazapiError, requests.RequestException, Exception) as e:
-        print(f"[worker] offers(hourly): FAILED product_id={p.id}: {e}")
-        return 0
+    print(f"[worker] offers(hourly): ALL GROUPS FAILED product_id={p.id}")
+    return int(p.id)  # <- IMPORTANTE: marca como enviado mesmo assim
+
+except (UazapiError, requests.RequestException, Exception) as e:
+    print(f"[worker] offers(hourly): FAILED product_id={p.id}: {e}")
+    return int(p.id)  # <- IMPORTANTE
 
 
 # ============================================================
@@ -1501,3 +1517,4 @@ if __name__ == "__main__":
         run_loop()
     except KeyboardInterrupt:
         print("[worker] stopped (Ctrl+C)")
+
