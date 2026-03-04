@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, date
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 from typing import Optional, Tuple
 
@@ -27,7 +28,7 @@ from app.services.id_gen import generate_public_id
 
 # helpers
 def _today_utc() -> date:
-    return datetime.utcnow().date()
+    return datetime.now(ZoneInfo("America/Sao_Paulo")).date()
 
 
 def _add_months(d: date, months: int) -> date:
@@ -302,7 +303,7 @@ def issue_promissory(db: Session, prom_id: int) -> PromissoryORM:
         return prom
 
     prom.status = PromissoryStatus.ISSUED
-    prom.issued_at = datetime.utcnow()
+    prom.issued_at = datetime.now(ZoneInfo("America/Sao_Paulo"))
     db.flush()
     return prom
 
@@ -369,7 +370,7 @@ def pay_installment(
         raise ValueError("paid_amount não pode ser negativo.")
 
     inst.status = InstallmentStatus.PAID
-    inst.paid_at = datetime.utcnow()
+    inst.paid_at = datetime.now(ZoneInfo("America/Sao_Paulo"))
     inst.paid_amount = amount_to_pay
     db.flush()
 
@@ -385,3 +386,4 @@ def pay_installment(
             db.flush()
 
     return inst
+
