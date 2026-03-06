@@ -19,7 +19,6 @@ class ProductCreate(BaseModel):
     sale_price: Decimal = Field(default=Decimal("0.00"), ge=0)
 
     status: Optional[str] = None
-    created_at: datetime   # ✅ novo campo
 
     # ✅ NOVO: auditoria de origem da compra (vendedor)
     purchase_seller_name: Optional[str] = Field(default=None, min_length=2, max_length=120)
@@ -72,6 +71,7 @@ class ProductOut(BaseModel):
     cost_price: Decimal
     sale_price: Decimal
     status: str
+    created_at: datetime   # ✅ novo campo
 
     # ✅ NOVO: auditoria de origem da compra (vendedor)
     purchase_seller_name: Optional[str]
@@ -80,4 +80,5 @@ class ProductOut(BaseModel):
     purchase_seller_address: Optional[str]
 
     images: List[ProductImageOut] = []
+
 
